@@ -1,0 +1,6 @@
+T(0, y) = sin(3.141592653589793 * y)
+T(x, 0) = 0
+T(x, 1) = 0
+grad(T, x) = 0.1 * grad(grad(T, y), y)
+
+# Expected function: T = exp(-0.1 * pi**2 * x) * sin(pi * y)

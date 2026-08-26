@@ -1,0 +1,3 @@
+f = exp(x + y)
+
+# Expected function: f = exp(x + y)

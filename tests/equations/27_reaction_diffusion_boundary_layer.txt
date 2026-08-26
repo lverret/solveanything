@@ -1,0 +1,7 @@
+u(0, y) = sin(3.141592653589793 * y)
+u(1, y) = exp(-10) * sin(3.141592653589793 * y)
+u(x, 0) = 0
+u(x, 1) = 0
+-0.01 * grad(grad(u, x), x) + u = 0
+
+# Expected function: u = exp(-10 * x) * sin(pi * y)

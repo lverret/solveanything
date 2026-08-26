@@ -1,0 +1,3 @@
+f = sin(2 * 3.141592653589793 * x) * cos(2 * 3.141592653589793 * y)
+
+# Expected function: f = sin(2 * pi * x) * cos(2 * pi * y)

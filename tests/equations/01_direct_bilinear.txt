@@ -1,0 +1,3 @@
+f = x * y
+
+# Expected function: f = x * y
