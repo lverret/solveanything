@@ -1,5 +1,5 @@
-u(x, 1) = 0
-v(x, 1) = 1
+u(x, 1) = 1
+v(x, 1) = 0
 u(x, 0) = 0
 v(x, 0) = 0
 u(0, y) = 0
@@ -9,3 +9,4 @@ v(1, y) = 0
 u * grad(u, x) + v * grad(u, y) + grad(p, x) = 1/100 * (grad(grad(u, x), x) + grad(grad(u, y), y))
 u * grad(v, x) + v * grad(v, y) + grad(p, y) = 1/100 * (grad(grad(v, x), x) + grad(grad(v, y), y))
 grad(u, x) + grad(v, y) = 0
+p(0, 0) = 0

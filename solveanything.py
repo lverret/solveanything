@@ -147,23 +147,35 @@ FUNS = {
     "grad": grad,
 }
 
-MODEL = {}
-
 # -----------------------------------------------------------------------------
 # Parser functions
 
 
 def parse_equations(equations):
-    vars = {}
+    variables = {}
     domains = []
     for formula in equations:
         splits = formula.split("=")
         if len(splits) != 2:
             raise InvalidFormula(formula, "Not a equation")
         lhs, rhs = splits
-        domain = {"x": torch.nan, "y": torch.nan}
-        vars |= parse(formula, ast.parse(lhs.strip(), mode="eval").body, vars, domain)
-        vars |= parse(formula, ast.parse(rhs.strip(), mode="eval").body, vars, domain)
+        fixed_coordinates = {"x": set(), "y": set()}
+        parse(
+            formula,
+            ast.parse(lhs.strip(), mode="eval").body,
+            variables,
+            fixed_coordinates,
+        )
+        parse(
+            formula,
+            ast.parse(rhs.strip(), mode="eval").body,
+            variables,
+            fixed_coordinates,
+        )
+        domain = {
+            coordinate: next(iter(values)) if len(values) == 1 else np.nan
+            for coordinate, values in fixed_coordinates.items()
+        }
         domains.append(domain)
         log = f"Parsed equation {len(domains)}: 'for "
         for inp in ["x", "y"]:
@@ -172,24 +184,22 @@ def parse_equations(equations):
             else:
                 log += f"{inp} = {domain[inp]}, "
         print(log[:-2] + f",  {formula}'")
-    vars = list(vars.keys())
-    for k, var in enumerate(vars):
-        code = f"global {var}\n" f"def {var}(x, y): return model(x, y)[:, {k}:{k+1}]"
-        exec(compile(code, "", "exec"))
-        MODEL[var] = globals()[var]
-    print(f"Found {len(vars)} unknown fonction(s) to approximate: {vars}")
-    return vars, domains
+    variables = list(variables.keys())
+    print(
+        f"Found {len(variables)} unknown function(s) to approximate: {variables}"
+    )
+    return variables, domains
 
 
-def parse(formula, node, vars, domain):
+def parse(formula, node, variables, fixed_coordinates):
     if isinstance(node, ast.Constant):
-        return vars
+        return variables
     elif isinstance(node, ast.UnaryOp) and type(node.op) in OPS:
-        return parse(formula, node.operand, vars, domain)
+        return parse(formula, node.operand, variables, fixed_coordinates)
     elif isinstance(node, ast.BinOp) and type(node.op) in OPS:
-        vars |= parse(formula, node.left, vars, domain)
-        vars |= parse(formula, node.right, vars, domain)
-        return vars
+        parse(formula, node.left, variables, fixed_coordinates)
+        parse(formula, node.right, variables, fixed_coordinates)
+        return variables
     elif isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in FUNS:
             if len(node.args) != len(signature(FUNS[node.func.id]).parameters):
@@ -197,8 +207,8 @@ def parse(formula, node, vars, domain):
                     formula, f"Invalid nb of args for '{node.func.id}'"
                 )
             for arg in node.args:
-                vars |= parse(formula, arg, vars, domain)
-            return vars
+                parse(formula, arg, variables, fixed_coordinates)
+            return variables
         elif isinstance(node.func, ast.Name) and node.func.id not in FUNS:
             if not all(isinstance(arg, (ast.Constant, ast.Name)) for arg in node.args):
                 raise InvalidFormula(formula, f"Found invalid arg for '{node.func.id}'")
@@ -216,79 +226,250 @@ def parse(formula, node, vars, domain):
                     formula, f"'{node.func.id}' takes as args only (x, y) in that order"
                 )
             for inp, arg in zip(["x", "y"], node.args):
-                if isinstance(arg, ast.Num):
-                    if not 0 <= arg.n <= 1:
+                if isinstance(arg, ast.Constant):
+                    value = arg.value
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise InvalidFormula(
+                            formula, f"Found invalid arg for '{node.func.id}'"
+                        )
+                    if not 0 <= value <= 1:
                         raise InvalidFormula(
                             formula, "Only functions in [0, 1] x [0, 1] are supported"
                         )
-                    domain[inp] = float(arg.n)
-            vars[node.func.id] = None
-            return vars
+                    fixed_coordinates[inp].add(float(value))
+            variables[node.func.id] = None
+            return variables
     elif isinstance(node, ast.Name):
         if node.id in ["x", "y"]:
-            return vars
+            return variables
         else:
-            vars = parse(
+            parse(
                 formula,
-                ast.Call(ast.Name(node.id), [ast.Name("x"), ast.Name("y")]),
-                vars,
-                domain,
+                ast.Call(
+                    func=ast.Name(id=node.id, ctx=ast.Load()),
+                    args=[
+                        ast.Name(id="x", ctx=ast.Load()),
+                        ast.Name(id="y", ctx=ast.Load()),
+                    ],
+                    keywords=[],
+                ),
+                variables,
+                fixed_coordinates,
             )
-            return vars
+            return variables
     raise InvalidFormula(formula, "Found unsupported token(s)")
 
 
-def eval(node, samples):
-    if isinstance(node, ast.Num):
-        return node.n
-    elif isinstance(node, ast.Str):
-        return node.s
+def _record_coordinate(used_coordinates, coordinate, value):
+    values = used_coordinates[coordinate]
+    if all(existing is not value for existing in values):
+        values.append(value)
+
+
+def _coordinate_value(
+    node, coordinate, samples, coordinate_cache, used_coordinates
+):
+    if isinstance(node, ast.Name):
+        value = samples[coordinate]
+    elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        key = (coordinate, float(node.value))
+        if key not in coordinate_cache:
+            coordinate_cache[key] = torch.full_like(
+                samples[coordinate], float(node.value), requires_grad=True
+            )
+        value = coordinate_cache[key]
+    else:
+        raise RuntimeError(f"Invalid coordinate argument: {ast.dump(node)}")
+    _record_coordinate(used_coordinates, coordinate, value)
+    return value
+
+
+def _merge_coordinates(source, destination):
+    for coordinate in ["x", "y"]:
+        for value in source[coordinate]:
+            _record_coordinate(destination, coordinate, value)
+
+
+def evaluate(
+    node,
+    samples,
+    model,
+    field_indices,
+    coordinate_cache=None,
+    used_coordinates=None,
+):
+    if coordinate_cache is None:
+        coordinate_cache = {}
+    if used_coordinates is None:
+        used_coordinates = {"x": [], "y": []}
+
+    if isinstance(node, ast.Constant):
+        return node.value
     elif isinstance(node, ast.UnaryOp) and type(node.op) in OPS:
-        return OPS[type(node.op)](eval(node.operand, samples))
-    elif isinstance(node, ast.BinOp) and type(node.op) in OPS:
-        return OPS[type(node.op)](eval(node.left, samples), eval(node.right, samples))
-    elif isinstance(node, ast.Call) and node.func.id in FUNS:
-        return FUNS[node.func.id](*(eval(arg, samples) for arg in node.args))
-    elif isinstance(node, ast.Call) and node.func.id in MODEL:
-        return MODEL[node.func.id](
-            eval(ast.Name("x"), samples), eval(ast.Name("y"), samples)
+        return OPS[type(node.op)](
+            evaluate(
+                node.operand,
+                samples,
+                model,
+                field_indices,
+                coordinate_cache,
+                used_coordinates,
+            )
         )
+    elif isinstance(node, ast.BinOp) and type(node.op) in OPS:
+        return OPS[type(node.op)](
+            evaluate(
+                node.left,
+                samples,
+                model,
+                field_indices,
+                coordinate_cache,
+                used_coordinates,
+            ),
+            evaluate(
+                node.right,
+                samples,
+                model,
+                field_indices,
+                coordinate_cache,
+                used_coordinates,
+            ),
+        )
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        function_name = node.func.id
+        if function_name == "grad":
+            coordinate_node = node.args[1]
+            if not isinstance(coordinate_node, ast.Name) or coordinate_node.id not in [
+                "x",
+                "y",
+            ]:
+                raise RuntimeError("grad expects x or y as its second argument")
+            coordinate = coordinate_node.id
+            local_coordinates = {"x": [], "y": []}
+            value = evaluate(
+                node.args[0],
+                samples,
+                model,
+                field_indices,
+                coordinate_cache,
+                local_coordinates,
+            )
+            targets = local_coordinates[coordinate]
+            if not targets:
+                targets = [samples[coordinate]]
+                _record_coordinate(local_coordinates, coordinate, targets[0])
+            result = sum(
+                (target * 0 for target in targets), torch.zeros_like(targets[0])
+            )
+            if torch.is_tensor(value) and value.requires_grad:
+                derivatives = torch.autograd.grad(
+                    value,
+                    targets,
+                    grad_outputs=torch.ones_like(value),
+                    create_graph=True,
+                    allow_unused=True,
+                )
+                for derivative in derivatives:
+                    if derivative is not None:
+                        result = result + derivative
+            _merge_coordinates(local_coordinates, used_coordinates)
+            return result
+        elif function_name in FUNS:
+            return FUNS[function_name](
+                *(
+                    evaluate(
+                        arg,
+                        samples,
+                        model,
+                        field_indices,
+                        coordinate_cache,
+                        used_coordinates,
+                    )
+                    for arg in node.args
+                )
+            )
+        elif function_name in field_indices:
+            coordinates = [
+                _coordinate_value(
+                    arg,
+                    coordinate,
+                    samples,
+                    coordinate_cache,
+                    used_coordinates,
+                )
+                for coordinate, arg in zip(["x", "y"], node.args)
+            ]
+            field_index = field_indices[function_name]
+            return model(*coordinates)[:, field_index : field_index + 1]
     elif isinstance(node, ast.Name):
         if node.id in ["x", "y"]:
+            _record_coordinate(used_coordinates, node.id, samples[node.id])
             return samples[node.id]
-        else:
-            return eval(
-                ast.Call(ast.Name(node.id), [ast.Name("x"), ast.Name("y")]), samples
+        elif node.id in field_indices:
+            return evaluate(
+                ast.Call(
+                    func=ast.Name(id=node.id, ctx=ast.Load()),
+                    args=[
+                        ast.Name(id="x", ctx=ast.Load()),
+                        ast.Name(id="y", ctx=ast.Load()),
+                    ],
+                    keywords=[],
+                ),
+                samples,
+                model,
+                field_indices,
+                coordinate_cache,
+                used_coordinates,
             )
-    raise RuntimeError()
+    raise RuntimeError(f"Unsupported expression: {ast.dump(node)}")
 
 
 # -----------------------------------------------------------------------------
 # Training and visualization functions
 
 
-def generate_samples(domain):
+def generate_samples(domain, nb_samples, device):
     samples = {"x": None, "y": None}
     for inp in ["x", "y"]:
         if np.isnan(domain[inp]):
-            samples[inp] = torch.rand(args.nb_samples, 1)
+            samples[inp] = torch.rand(nb_samples, 1)
         else:
-            samples[inp] = torch.ones(args.nb_samples, 1) * domain[inp]
+            samples[inp] = torch.ones(nb_samples, 1) * domain[inp]
         samples[inp] = (
-            samples[inp].clone().detach().requires_grad_(True).to(args.device)
+            samples[inp].clone().detach().requires_grad_(True).to(device)
         )
     return samples
 
 
-def compute_loss(equations, domains):
-    loss = 0
+def compute_loss(
+    equations,
+    domains,
+    model,
+    field_indices,
+    nb_samples,
+    device,
+    loss_weighting="equal",
+):
+    losses = []
     for formula, domain in zip(equations, domains):
         lhs, rhs = formula.split("=")
-        samples = generate_samples(domain)
-        w = 0.1 if np.isnan(domain["x"]) and np.isnan(domain["y"]) else 0.9
-        res = eval(ast.parse(f"{lhs} - ({rhs})".strip(), mode="eval").body, samples)
-        loss += w * torch.mean(torch.abs(res))
-    return loss
+        samples = generate_samples(domain, nb_samples, device)
+        res = evaluate(
+            ast.parse(f"{lhs} - ({rhs})".strip(), mode="eval").body,
+            samples,
+            model,
+            field_indices,
+        )
+        equation_loss = torch.mean(torch.abs(res))
+        if loss_weighting == "legacy":
+            weight = (
+                0.1 if np.isnan(domain["x"]) and np.isnan(domain["y"]) else 0.9
+            )
+            equation_loss = weight * equation_loss
+        losses.append(equation_loss)
+    if loss_weighting == "legacy":
+        return torch.stack(losses).sum()
+    return torch.stack(losses).mean()
 
 
 def make_gif(frames, vars):
@@ -344,6 +525,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr", type=float, default=0.0001, help="learning rate")
     parser.add_argument(
+        "--lr_gamma",
+        type=float,
+        default=1.0,
+        help="per-iteration exponential LR factor; 1.0 disables decay",
+    )
+    parser.add_argument(
+        "--loss_weighting",
+        choices=["equal", "legacy"],
+        default="equal",
+        help="equation weighting strategy",
+    )
+    parser.add_argument(
         "--hidden_layers", type=int, default=4, help="number of hidden layers"
     )
     parser.add_argument(
@@ -359,6 +552,9 @@ if __name__ == "__main__":
         "--nb_frames", type=int, default=50, help="number of frames for the gif"
     )
     parser.add_argument("--device", type=str, default="cpu", help="device to use")
+    parser.add_argument(
+        "--no_gif", action="store_true", help="skip GIF frame collection and export"
+    )
     args = parser.parse_args()
 
     with open(args.input_file, "r") as f:
@@ -366,6 +562,7 @@ if __name__ == "__main__":
     equations = data.splitlines()
 
     vars, domains = parse_equations(equations)
+    field_indices = {var: index for index, var in enumerate(vars)}
 
     model = Siren(
         in_features=2,
@@ -377,19 +574,32 @@ if __name__ == "__main__":
     ).to(args.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    scheduler = (
+        torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_gamma)
+        if args.lr_gamma != 1.0
+        else None
+    )
 
     pbar = trange(args.nb_iter, desc="Solving equation(s)")
     frames = []
 
     for it in pbar:
-        loss = compute_loss(equations, domains)
+        loss = compute_loss(
+            equations,
+            domains,
+            model,
+            field_indices,
+            args.nb_samples,
+            args.device,
+            args.loss_weighting,
+        )
         model.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         pbar.set_postfix(loss=loss.item())
-        if it % max(1, (args.nb_iter // args.nb_frames)) == 0:
+        if not args.no_gif and it % max(1, (args.nb_iter // args.nb_frames)) == 0:
             xy = torch.cartesian_prod(
                 torch.linspace(0, 1, args.resolution),
                 torch.linspace(0, 1, args.resolution),
@@ -399,4 +609,5 @@ if __name__ == "__main__":
             out = out.rot90().cpu().data.numpy()
             frames.append(out)
 
-    make_gif(frames, vars)
+    if not args.no_gif:
+        make_gif(frames, vars)
