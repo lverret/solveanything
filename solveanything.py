@@ -185,9 +185,7 @@ def parse_equations(equations):
                 log += f"{inp} = {domain[inp]}, "
         print(log[:-2] + f",  {formula}'")
     variables = list(variables.keys())
-    print(
-        f"Found {len(variables)} unknown function(s) to approximate: {variables}"
-    )
+    print(f"Found {len(variables)} unknown function(s) to approximate: {variables}")
     return variables, domains
 
 
@@ -266,9 +264,7 @@ def _record_coordinate(used_coordinates, coordinate, value):
         values.append(value)
 
 
-def _coordinate_value(
-    node, coordinate, samples, coordinate_cache, used_coordinates
-):
+def _coordinate_value(node, coordinate, samples, coordinate_cache, used_coordinates):
     if isinstance(node, ast.Name):
         value = samples[coordinate]
     elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
@@ -435,9 +431,7 @@ def generate_samples(domain, nb_samples, device):
             samples[inp] = torch.rand(nb_samples, 1)
         else:
             samples[inp] = torch.ones(nb_samples, 1) * domain[inp]
-        samples[inp] = (
-            samples[inp].clone().detach().requires_grad_(True).to(device)
-        )
+        samples[inp] = samples[inp].clone().detach().requires_grad_(True).to(device)
     return samples
 
 
@@ -448,7 +442,6 @@ def compute_loss(
     field_indices,
     nb_samples,
     device,
-    loss_weighting="equal",
 ):
     losses = []
     for formula, domain in zip(equations, domains):
@@ -461,14 +454,8 @@ def compute_loss(
             field_indices,
         )
         equation_loss = torch.mean(torch.abs(res))
-        if loss_weighting == "legacy":
-            weight = (
-                0.1 if np.isnan(domain["x"]) and np.isnan(domain["y"]) else 0.9
-            )
-            equation_loss = weight * equation_loss
-        losses.append(equation_loss)
-    if loss_weighting == "legacy":
-        return torch.stack(losses).sum()
+        weight = 0.1 if np.isnan(domain["x"]) and np.isnan(domain["y"]) else 0.9
+        losses.append(weight * equation_loss)
     return torch.stack(losses).mean()
 
 
@@ -527,14 +514,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr_gamma",
         type=float,
-        default=1.0,
-        help="per-iteration exponential LR factor; 1.0 disables decay",
-    )
-    parser.add_argument(
-        "--loss_weighting",
-        choices=["equal", "legacy"],
-        default="equal",
-        help="equation weighting strategy",
+        default=0.99,
+        help="per-iteration exponential LR factor",
     )
     parser.add_argument(
         "--hidden_layers", type=int, default=4, help="number of hidden layers"
@@ -591,7 +572,6 @@ if __name__ == "__main__":
             field_indices,
             args.nb_samples,
             args.device,
-            args.loss_weighting,
         )
         model.zero_grad(set_to_none=True)
         loss.backward()
