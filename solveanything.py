@@ -151,7 +151,7 @@ FUNS = {
 # Parser functions
 
 
-def parse_equations(equations):
+def parse_equations(equations, verbose=True):
     variables = {}
     domains = []
     for formula in equations:
@@ -183,10 +183,31 @@ def parse_equations(equations):
                 log += f"{inp} in (0, 1), "
             else:
                 log += f"{inp} = {domain[inp]}, "
-        print(log[:-2] + f",  {formula}'")
+        if verbose:
+            print(log[:-2] + f",  {formula}'")
     variables = list(variables.keys())
-    print(f"Found {len(variables)} unknown function(s) to approximate: {variables}")
+    if verbose:
+        print(f"Found {len(variables)} unknown function(s) to approximate: {variables}")
     return variables, domains
+
+
+def parse_equation_file(input_file, verbose=True):
+    """Read and parse equations from a text file.
+
+    Blank lines and comments are ignored, which lets callers attach metadata to
+    equation files without passing it to the mathematical expression parser.
+    """
+    with open(input_file, "r", encoding="utf-8") as file:
+        equations = [
+            line.strip()
+            for line in file
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    if not equations:
+        raise ValueError(f"No equations found in '{input_file}'")
+
+    variables, domains = parse_equations(equations, verbose=verbose)
+    return equations, variables, domains
 
 
 def parse(formula, node, variables, fixed_coordinates):
@@ -459,7 +480,77 @@ def compute_loss(
     return torch.stack(losses).mean()
 
 
-def make_gif(frames, vars):
+def train_model(
+    equations,
+    variables,
+    domains,
+    nb_iter=500,
+    nb_samples=1000,
+    lr=0.0001,
+    lr_gamma=0.99,
+    hidden_layers=4,
+    hidden_features=256,
+    first_omega_0=10.0,
+    hidden_omega_0=30.0,
+    device="cpu",
+    progress=True,
+    iteration_callback=None,
+):
+    """Train and return a SIREN that approximates the parsed variables.
+
+    ``iteration_callback`` receives ``(iteration, model, loss_value)`` after
+    each optimizer step. It is used by the CLI for optional frame collection
+    without coupling the reusable training loop to GIF generation.
+    """
+    field_indices = {
+        variable: index for index, variable in enumerate(variables)
+    }
+    model = Siren(
+        in_features=2,
+        hidden_features=hidden_features,
+        hidden_layers=hidden_layers,
+        out_features=len(variables),
+        first_omega_0=first_omega_0,
+        hidden_omega_0=hidden_omega_0,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=lr_gamma
+    )
+    iterations = (
+        trange(nb_iter, desc="Solving equation(s)") if progress else range(nb_iter)
+    )
+
+    model.train()
+    for iteration in iterations:
+        optimizer.zero_grad(set_to_none=True)
+        loss = compute_loss(
+            equations,
+            domains,
+            model,
+            field_indices,
+            nb_samples,
+            device,
+        )
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Non-finite training loss at iteration {iteration}"
+            )
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        loss_value = loss.item()
+        if progress:
+            iterations.set_postfix(loss=loss_value)
+        if iteration_callback is not None:
+            iteration_callback(iteration, model, loss_value)
+
+    return model
+
+
+def make_gif(frames, vars, output_file):
     ims = []
     nr = int(np.sqrt(len(vars)))
     nc = len(vars) // nr + len(vars) % nr
@@ -491,7 +582,7 @@ def make_gif(frames, vars):
     ani = FuncAnimation(fig, animate, frames=len(frames))
     pbar = trange(len(frames), desc="Generating GIF")
     ani.save(
-        args.output_file,
+        output_file,
         writer=PillowWriter(fps=len(frames) / 3),
         progress_callback=lambda i, n: pbar.update(1),
     )
@@ -538,56 +629,35 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    with open(args.input_file, "r") as f:
-        data = f.read()
-    equations = data.splitlines()
-
-    vars, domains = parse_equations(equations)
-    field_indices = {var: index for index, var in enumerate(vars)}
-
-    model = Siren(
-        in_features=2,
-        hidden_features=args.hidden_features,
-        hidden_layers=args.hidden_layers,
-        out_features=len(vars),
-        first_omega_0=args.omega_0,
-        hidden_omega_0=30.0,
-    ).to(args.device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = (
-        torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_gamma)
-        if args.lr_gamma != 1.0
-        else None
-    )
-
-    pbar = trange(args.nb_iter, desc="Solving equation(s)")
+    equations, vars, domains = parse_equation_file(args.input_file)
     frames = []
 
-    for it in pbar:
-        loss = compute_loss(
-            equations,
-            domains,
-            model,
-            field_indices,
-            args.nb_samples,
-            args.device,
-        )
-        model.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        pbar.set_postfix(loss=loss.item())
-        if not args.no_gif and it % max(1, (args.nb_iter // args.nb_frames)) == 0:
+    def collect_frame(iteration, model, loss_value):
+        if iteration % max(1, (args.nb_iter // args.nb_frames)) == 0:
             xy = torch.cartesian_prod(
                 torch.linspace(0, 1, args.resolution),
                 torch.linspace(0, 1, args.resolution),
             ).to(args.device)
-            out = model(xy[:, 0:1], xy[:, 1:2])
+            with torch.no_grad():
+                out = model(xy[:, 0:1], xy[:, 1:2])
             out = out.view(args.resolution, args.resolution, out.size(-1))
-            out = out.rot90().cpu().data.numpy()
+            out = out.rot90().cpu().numpy()
             frames.append(out)
 
+    model = train_model(
+        equations,
+        vars,
+        domains,
+        nb_iter=args.nb_iter,
+        nb_samples=args.nb_samples,
+        lr=args.lr,
+        lr_gamma=args.lr_gamma,
+        hidden_layers=args.hidden_layers,
+        hidden_features=args.hidden_features,
+        first_omega_0=args.omega_0,
+        device=args.device,
+        iteration_callback=None if args.no_gif else collect_frame,
+    )
+
     if not args.no_gif:
-        make_gif(frames, vars)
+        make_gif(frames, vars, args.output_file)

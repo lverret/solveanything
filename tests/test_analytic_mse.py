@@ -21,8 +21,6 @@ Select individual cases by filename stem:
 """
 
 import ast
-import contextlib
-import io
 import math
 import operator
 import os
@@ -33,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import solveanything as solver
+from solveanything import parse_equation_file, train_model
 
 
 EQUATION_DIRECTORY = Path(__file__).with_name("equations")
@@ -41,20 +39,9 @@ EXPECTED_PATTERN = re.compile(
     r"^\s*#\s*Expected function:\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$"
 )
 
-# Keep these aligned with the solver configuration being benchmarked.
-NB_ITERATIONS = 500
-NB_SAMPLES = 1000
-LEARNING_RATE = 1e-4
-LR_GAMMA = 0.99
-LOSS_WEIGHTING = "legacy"
-HIDDEN_LAYERS = 4
-HIDDEN_FEATURES = 256
-FIRST_OMEGA_0 = 10.0
-HIDDEN_OMEGA_0 = 30.0
 SEED = 0
 GRID_RESOLUTION = 81
 MSE_TOLERANCE = 1e-2
-DEVICE = "cpu"
 
 RUN_BENCHMARKS = os.environ.get("SOLVEANYTHING_RUN_BENCHMARKS") == "1"
 SELECTED_CASES = {
@@ -84,9 +71,8 @@ EXPECTED_FUNCTIONS = {
 }
 
 
-def parse_equation_file(path):
-    """Return solver equations and expected expressions from path."""
-    equations = []
+def parse_expected_functions(path):
+    """Return the expected expressions declared in an equation file."""
     expected_functions = {}
 
     for line_number, raw_line in enumerate(
@@ -103,16 +89,10 @@ def parse_equation_file(path):
             expected_functions[field] = ast.parse(expression, mode="eval").body
             continue
 
-        stripped = raw_line.strip()
-        if stripped and not stripped.startswith("#"):
-            equations.append(stripped)
-
-    if not equations:
-        raise ValueError(f"{path}: no equations found")
     if not expected_functions:
         raise ValueError(f"{path}: no '# Expected function:' metadata found")
 
-    return equations, expected_functions
+    return expected_functions
 
 
 def _evaluate_expected_node(node, x, y):
@@ -170,13 +150,12 @@ def evaluate_expected_function(node, x, y):
 
 def train_and_measure_mse(path):
     """Train one default SIREN and return absolute grid MSE for every field."""
-    equations, expected_functions = parse_equation_file(path)
+    expected_functions = parse_expected_functions(path)
 
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        variables, domains = solver.parse_equations(equations)
+    equations, variables, domains = parse_equation_file(path, verbose=False)
     if set(variables) != set(expected_functions):
         raise AssertionError(
             f"{path.name}: solver fields {variables!r} do not match expected fields "
@@ -186,42 +165,16 @@ def train_and_measure_mse(path):
     field_indices = {
         variable: index for index, variable in enumerate(variables)
     }
-    model = solver.Siren(
-        in_features=2,
-        hidden_features=HIDDEN_FEATURES,
-        hidden_layers=HIDDEN_LAYERS,
-        out_features=len(variables),
-        first_omega_0=FIRST_OMEGA_0,
-        hidden_omega_0=HIDDEN_OMEGA_0,
-    ).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=LR_GAMMA
+    model = train_model(
+        equations,
+        variables,
+        domains,
+        progress=False,
     )
 
-    model.train()
-    for iteration in range(NB_ITERATIONS):
-        optimizer.zero_grad(set_to_none=True)
-        loss = solver.compute_loss(
-            equations,
-            domains,
-            model,
-            field_indices,
-            NB_SAMPLES,
-            DEVICE,
-            loss_weighting=LOSS_WEIGHTING,
-        )
-        if not torch.isfinite(loss):
-            raise AssertionError(
-                f"{path.name}: non-finite training loss at iteration {iteration}"
-            )
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
     coordinates = torch.cartesian_prod(
-        torch.linspace(0.0, 1.0, GRID_RESOLUTION, device=DEVICE),
-        torch.linspace(0.0, 1.0, GRID_RESOLUTION, device=DEVICE),
+        torch.linspace(0.0, 1.0, GRID_RESOLUTION),
+        torch.linspace(0.0, 1.0, GRID_RESOLUTION),
     )
     model.eval()
     with torch.no_grad():
@@ -256,9 +209,8 @@ class AnalyticMetadataTests(unittest.TestCase):
         sample_y = np.array([1.0, 0.5, 0.0])
         for path in EQUATION_FILES:
             with self.subTest(path=path.name):
-                equations, expected_functions = parse_equation_file(path)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    variables, _ = solver.parse_equations(equations)
+                expected_functions = parse_expected_functions(path)
+                _, variables, _ = parse_equation_file(path, verbose=False)
                 self.assertEqual(set(variables), set(expected_functions))
                 for expected_node in expected_functions.values():
                     values = evaluate_expected_function(
