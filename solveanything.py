@@ -1,5 +1,6 @@
 import argparse
 import ast
+import re
 import numpy as np
 import torch
 import operator
@@ -128,6 +129,7 @@ def grad(y, x):
 
 OPS = {
     ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -136,16 +138,27 @@ OPS = {
 }
 
 
-FUNS = {
+MATH_FUNS = {
     "sqrt": sqrt,
     "sin": sin,
     "cos": cos,
     "exp": exp,
     "abs": abs,
     "tanh": tanh,
+}
+
+
+FUNS = {
+    **MATH_FUNS,
     "image": image,
     "grad": grad,
 }
+
+
+CONSTANTS = {"pi": np.pi}
+EXPECTED_FUNCTION_PATTERN = re.compile(
+    r"^\s*#\s*Expected function:\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$"
+)
 
 # -----------------------------------------------------------------------------
 # Parser functions
@@ -210,25 +223,45 @@ def parse_equation_file(input_file, verbose=True):
     return equations, variables, domains
 
 
-def parse(formula, node, variables, fixed_coordinates):
+def parse(
+    formula,
+    node,
+    variables,
+    fixed_coordinates,
+    functions=None,
+    allow_unknown_functions=True,
+):
+    if functions is None:
+        functions = FUNS
+
+    def parse_child(child):
+        return parse(
+            formula,
+            child,
+            variables,
+            fixed_coordinates,
+            functions,
+            allow_unknown_functions,
+        )
+
     if isinstance(node, ast.Constant):
         return variables
     elif isinstance(node, ast.UnaryOp) and type(node.op) in OPS:
-        return parse(formula, node.operand, variables, fixed_coordinates)
+        return parse_child(node.operand)
     elif isinstance(node, ast.BinOp) and type(node.op) in OPS:
-        parse(formula, node.left, variables, fixed_coordinates)
-        parse(formula, node.right, variables, fixed_coordinates)
+        parse_child(node.left)
+        parse_child(node.right)
         return variables
     elif isinstance(node, ast.Call):
-        if isinstance(node.func, ast.Name) and node.func.id in FUNS:
-            if len(node.args) != len(signature(FUNS[node.func.id]).parameters):
+        if isinstance(node.func, ast.Name) and node.func.id in functions:
+            if len(node.args) != len(signature(functions[node.func.id]).parameters):
                 raise InvalidFormula(
                     formula, f"Invalid nb of args for '{node.func.id}'"
                 )
             for arg in node.args:
-                parse(formula, arg, variables, fixed_coordinates)
+                parse_child(arg)
             return variables
-        elif isinstance(node.func, ast.Name) and node.func.id not in FUNS:
+        elif isinstance(node.func, ast.Name) and allow_unknown_functions:
             if not all(isinstance(arg, (ast.Constant, ast.Name)) for arg in node.args):
                 raise InvalidFormula(formula, f"Found invalid arg for '{node.func.id}'")
             if len(node.args) != 2:
@@ -259,11 +292,10 @@ def parse(formula, node, variables, fixed_coordinates):
             variables[node.func.id] = None
             return variables
     elif isinstance(node, ast.Name):
-        if node.id in ["x", "y"]:
+        if node.id in ["x", "y"] or node.id in CONSTANTS:
             return variables
-        else:
-            parse(
-                formula,
+        elif allow_unknown_functions:
+            parse_child(
                 ast.Call(
                     func=ast.Name(id=node.id, ctx=ast.Load()),
                     args=[
@@ -272,11 +304,44 @@ def parse(formula, node, variables, fixed_coordinates):
                     ],
                     keywords=[],
                 ),
-                variables,
-                fixed_coordinates,
             )
             return variables
     raise InvalidFormula(formula, "Found unsupported token(s)")
+
+
+def parse_expected_functions(input_file):
+    """Parse and validate expected-function metadata from an equation file."""
+    expected_functions = {}
+    with open(input_file, "r", encoding="utf-8") as file:
+        for line_number, raw_line in enumerate(file, start=1):
+            expected_match = EXPECTED_FUNCTION_PATTERN.match(raw_line)
+            if expected_match is None:
+                continue
+
+            field, expression = expected_match.groups()
+            if field in expected_functions:
+                raise ValueError(
+                    f"{input_file}:{line_number}: duplicate expected function "
+                    f"for {field!r}"
+                )
+            node = ast.parse(
+                expression, filename=str(input_file), mode="eval"
+            ).body
+            parse(
+                raw_line.strip(),
+                node,
+                variables={},
+                fixed_coordinates={"x": set(), "y": set()},
+                functions=MATH_FUNS,
+                allow_unknown_functions=False,
+            )
+            expected_functions[field] = node
+
+    if not expected_functions:
+        raise ValueError(
+            f"{input_file}: no '# Expected function:' metadata found"
+        )
+    return expected_functions
 
 
 def _record_coordinate(used_coordinates, coordinate, value):
@@ -419,9 +484,12 @@ def evaluate(
             field_index = field_indices[function_name]
             return model(*coordinates)[:, field_index : field_index + 1]
     elif isinstance(node, ast.Name):
-        if node.id in ["x", "y"]:
-            _record_coordinate(used_coordinates, node.id, samples[node.id])
+        if node.id in samples:
+            if node.id in ["x", "y"]:
+                _record_coordinate(used_coordinates, node.id, samples[node.id])
             return samples[node.id]
+        elif node.id in CONSTANTS:
+            return CONSTANTS[node.id]
         elif node.id in field_indices:
             return evaluate(
                 ast.Call(
@@ -439,6 +507,28 @@ def evaluate(
                 used_coordinates,
             )
     raise RuntimeError(f"Unsupported expression: {ast.dump(node)}")
+
+
+def evaluate_expected_function(node, x, y):
+    """Evaluate a parsed expected function using the solver's Torch evaluator."""
+    value = evaluate(
+        node,
+        samples={"x": x, "y": y},
+        model=None,
+        field_indices={},
+    )
+    value = torch.as_tensor(value, dtype=x.dtype, device=x.device)
+    if value.ndim == 0:
+        value = value.expand_as(x)
+    try:
+        value = torch.broadcast_to(value, x.shape)
+    except RuntimeError as error:
+        raise ValueError(
+            f"Expected function has shape {tuple(value.shape)}, not {tuple(x.shape)}"
+        ) from error
+    if not torch.isfinite(value).all():
+        raise ValueError("Expected function produced a non-finite value")
+    return value
 
 
 # -----------------------------------------------------------------------------
