@@ -1,0 +1,9 @@
+# Equations
+u(x, 0) = x**2
+v(x, 0) = 0
+grad(u, x) = grad(v, y)
+grad(u, y) = -grad(v, x)
+
+# Solution
+u = x**2 - y**2
+v = 2 * x * y

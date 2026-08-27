@@ -1,0 +1,9 @@
+# Equations
+u(0, y) = sin(y)
+u(1, y) = exp(1) * sin(y)
+u(x, 0) = 0
+u(x, 1) = exp(x) * sin(1)
+grad(grad(u, x), x) + grad(grad(u, y), y) = 0
+
+# Solution
+u = exp(x) * sin(y)

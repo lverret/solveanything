@@ -1,0 +1,7 @@
+# Equations
+u(0, y) = sin(2 * pi * y)
+u(x, 0) = -sin(2 * pi * x)
+grad(u, x) + grad(u, y) = 0
+
+# Solution
+u = sin(2 * pi * (y - x))

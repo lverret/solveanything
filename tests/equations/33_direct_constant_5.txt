@@ -1,3 +1,0 @@
-f = 5
-
-# Expected function: f = 5

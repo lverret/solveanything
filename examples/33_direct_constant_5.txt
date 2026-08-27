@@ -1,0 +1,5 @@
+# Equations
+f = 5
+
+# Solution
+f = 5

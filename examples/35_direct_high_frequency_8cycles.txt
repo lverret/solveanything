@@ -1,0 +1,5 @@
+# Equations
+f = sin(16 * pi * x) * sin(16 * pi * y)
+
+# Solution
+f = sin(16 * pi * x) * sin(16 * pi * y)

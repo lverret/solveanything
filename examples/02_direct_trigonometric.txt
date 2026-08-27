@@ -1,0 +1,5 @@
+# Equations
+f = sin(2 * pi * x) * cos(2 * pi * y)
+
+# Solution
+f = sin(2 * pi * x) * cos(2 * pi * y)

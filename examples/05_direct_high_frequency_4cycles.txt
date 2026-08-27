@@ -1,0 +1,5 @@
+# Equations
+f = sin(8 * pi * x) * sin(8 * pi * y)
+
+# Solution
+f = sin(8 * pi * x) * sin(8 * pi * y)

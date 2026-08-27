@@ -1,0 +1,5 @@
+# Equations
+f = exp(x + y)
+
+# Solution
+f = exp(x + y)

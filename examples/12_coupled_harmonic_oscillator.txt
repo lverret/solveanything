@@ -1,0 +1,9 @@
+# Equations
+u(0, y) = sin(pi * y)
+v(0, y) = 0
+grad(u, x) = v
+grad(v, x) = -u
+
+# Solution
+u = cos(x) * sin(pi * y)
+v = -sin(x) * sin(pi * y)

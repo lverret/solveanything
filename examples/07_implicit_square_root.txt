@@ -1,0 +1,7 @@
+# Equations
+f**2 = x * y
+f(1, y) = sqrt(y)
+f(x, 1) = sqrt(x)
+
+# Solution
+f = sqrt(x * y)

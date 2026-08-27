@@ -156,9 +156,7 @@ FUNS = {
 
 
 CONSTANTS = {"pi": np.pi}
-EXPECTED_FUNCTION_PATTERN = re.compile(
-    r"^\s*#\s*Expected function:\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$"
-)
+SECTION_PATTERN = re.compile(r"^\s*#\s*(Equations|Solution)\s*$", re.IGNORECASE)
 
 # -----------------------------------------------------------------------------
 # Parser functions
@@ -204,22 +202,115 @@ def parse_equations(equations, verbose=True):
     return variables, domains
 
 
-def parse_equation_file(input_file, verbose=True):
-    """Read and parse equations from a text file.
+def _read_problem_sections(input_file):
+    sections = {"equations": [], "solution": []}
+    seen_sections = set()
+    current_section = None
 
-    Blank lines and comments are ignored, which lets callers attach metadata to
-    equation files without passing it to the mathematical expression parser.
-    """
     with open(input_file, "r", encoding="utf-8") as file:
-        equations = [
-            line.strip()
-            for line in file
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
-    if not equations:
-        raise ValueError(f"No equations found in '{input_file}'")
+        for line_number, raw_line in enumerate(file, start=1):
+            section_match = SECTION_PATTERN.match(raw_line)
+            if section_match is not None:
+                section = section_match.group(1).lower()
+                if section in seen_sections:
+                    raise ValueError(
+                        f"{input_file}:{line_number}: duplicate "
+                        f"'#{section_match.group(1)}' section"
+                    )
+                if section == "solution" and "equations" not in seen_sections:
+                    raise ValueError(
+                        f"{input_file}:{line_number}: '# Solution' must follow "
+                        "'# Equations'"
+                    )
+                seen_sections.add(section)
+                current_section = section
+                continue
 
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if current_section is None:
+                raise ValueError(
+                    f"{input_file}:{line_number}: content must be placed below "
+                    "'# Equations' or '# Solution'"
+                )
+            sections[current_section].append((line_number, line))
+
+    if "equations" not in seen_sections:
+        raise ValueError(f"{input_file}: missing '# Equations' section")
+    if not sections["equations"]:
+        raise ValueError(f"{input_file}: '# Equations' section is empty")
+    if "solution" in seen_sections and not sections["solution"]:
+        raise ValueError(f"{input_file}: '# Solution' section is empty")
+
+    return sections, "solution" in seen_sections
+
+
+def _parse_solution_equations(solution_equations, input_file="<solution>"):
+    """Parse ``field = expression`` formulas from a ``# Solution`` section."""
+    solution_functions = {}
+    for line_number, formula in solution_equations:
+        splits = formula.split("=")
+        if len(splits) != 2:
+            raise ValueError(
+                f"{input_file}:{line_number}: solution must have the form "
+                "'field = expression'"
+            )
+        lhs, rhs = (part.strip() for part in splits)
+        lhs_node = ast.parse(lhs, filename=str(input_file), mode="eval").body
+        if not isinstance(lhs_node, ast.Name):
+            raise ValueError(
+                f"{input_file}:{line_number}: solution field must be a name"
+            )
+        field = lhs_node.id
+        if field in solution_functions:
+            raise ValueError(
+                f"{input_file}:{line_number}: duplicate solution for {field!r}"
+            )
+
+        node = ast.parse(rhs, filename=str(input_file), mode="eval").body
+        parse(
+            formula,
+            node,
+            variables={},
+            fixed_coordinates={"x": set(), "y": set()},
+            functions=MATH_FUNS,
+            allow_unknown_functions=False,
+        )
+        solution_functions[field] = node
+    return solution_functions
+
+
+def parse_problem_file(input_file, verbose=True):
+    """Parse equations and an optional analytic solution from a problem file."""
+    sections, has_solution = _read_problem_sections(input_file)
+    equations = [formula for _, formula in sections["equations"]]
     variables, domains = parse_equations(equations, verbose=verbose)
+    solution_functions = _parse_solution_equations(
+        sections["solution"], input_file=input_file
+    )
+
+    if has_solution and set(solution_functions) != set(variables):
+        missing = sorted(set(variables) - set(solution_functions))
+        unknown = sorted(set(solution_functions) - set(variables))
+        details = []
+        if missing:
+            details.append(f"missing fields {missing}")
+        if unknown:
+            details.append(f"unknown fields {unknown}")
+        raise ValueError(
+            f"{input_file}: '# Solution' does not match the equations "
+            f"({', '.join(details)})"
+        )
+
+    return equations, variables, domains, solution_functions
+
+
+def parse_equation_file(input_file, verbose=True):
+    """Compatibility wrapper returning equations, variables and domains."""
+    equations, variables, domains, _ = parse_problem_file(
+        input_file, verbose=verbose
+    )
     return equations, variables, domains
 
 
@@ -307,41 +398,6 @@ def parse(
             )
             return variables
     raise InvalidFormula(formula, "Found unsupported token(s)")
-
-
-def parse_expected_functions(input_file):
-    """Parse and validate expected-function metadata from an equation file."""
-    expected_functions = {}
-    with open(input_file, "r", encoding="utf-8") as file:
-        for line_number, raw_line in enumerate(file, start=1):
-            expected_match = EXPECTED_FUNCTION_PATTERN.match(raw_line)
-            if expected_match is None:
-                continue
-
-            field, expression = expected_match.groups()
-            if field in expected_functions:
-                raise ValueError(
-                    f"{input_file}:{line_number}: duplicate expected function "
-                    f"for {field!r}"
-                )
-            node = ast.parse(
-                expression, filename=str(input_file), mode="eval"
-            ).body
-            parse(
-                raw_line.strip(),
-                node,
-                variables={},
-                fixed_coordinates={"x": set(), "y": set()},
-                functions=MATH_FUNS,
-                allow_unknown_functions=False,
-            )
-            expected_functions[field] = node
-
-    if not expected_functions:
-        raise ValueError(
-            f"{input_file}: no '# Expected function:' metadata found"
-        )
-    return expected_functions
 
 
 def _record_coordinate(used_coordinates, coordinate, value):
@@ -510,7 +566,7 @@ def evaluate(
 
 
 def evaluate_expected_function(node, x, y):
-    """Evaluate a parsed expected function using the solver's Torch evaluator."""
+    """Evaluate one parsed solution expression with the shared Torch evaluator."""
     value = evaluate(
         node,
         samples={"x": x, "y": y},
@@ -529,6 +585,19 @@ def evaluate_expected_function(node, x, y):
     if not torch.isfinite(value).all():
         raise ValueError("Expected function produced a non-finite value")
     return value
+
+
+def evaluate_solution_functions(solution_functions, variables, x, y):
+    """Evaluate solution fields in the same order as the model outputs."""
+    if set(solution_functions) != set(variables):
+        raise ValueError("Solution fields do not match model output fields")
+    return torch.stack(
+        [
+            evaluate_expected_function(solution_functions[variable], x, y)
+            for variable in variables
+        ],
+        dim=-1,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -640,34 +709,92 @@ def train_model(
     return model
 
 
-def make_gif(frames, vars, output_file):
-    ims = []
-    nr = int(np.sqrt(len(vars)))
-    nc = len(vars) // nr + len(vars) % nr
-    fig, axs = plt.subplots(nr, nc, figsize=(4.8 * nc, 4.0 * nr))
-    if nr == 1:
-        axs = np.array((axs,))
-    if nc == 1:
-        axs = np.array((axs,))
-    for k, var in enumerate(vars):
-        i, j = k // nc, k % nc
-        ims.append(axs[i, j].imshow(frames[0][:, :, k], extent=(0, 1, 0, 1)))
-        fig.colorbar(ims[k], ax=axs[i, j])
-        axs[i, j].set_xlabel("x")
-        axs[i, j].set_ylabel("y")
-        axs[i, j].set_title(var)
-        axs[i, j].margins(0)
-    for k in range(len(vars), nc * nr):
-        i, j = k // nc, k % nc
-        fig.delaxes(axs[i][j])
+def _plot_limits(minimum, maximum):
+    if minimum == maximum:
+        padding = max(0.5, abs(minimum) * 0.05)
+        return minimum - padding, maximum + padding
+    return minimum, maximum
+
+
+def make_gif(frames, variables, output_file, solution=None):
+    """Animate approximations and optionally show analytic solutions below them."""
+    if not frames:
+        raise ValueError("Cannot generate a GIF without frames")
+
+    frames = [np.asarray(frame) for frame in frames]
+    if solution is not None:
+        solution = np.asarray(solution)
+        if solution.shape != frames[0].shape:
+            raise ValueError(
+                f"Solution grid has shape {solution.shape}, expected "
+                f"{frames[0].shape}"
+            )
+
+    row_count = 2 if solution is not None else 1
+    column_count = len(variables)
+    fig, axes = plt.subplots(
+        row_count,
+        column_count,
+        squeeze=False,
+        figsize=(4.8 * column_count, 4.0 * row_count),
+    )
+    approximation_images = []
+
+    for field_index, variable in enumerate(variables):
+        if solution is not None:
+            minimum = min(
+                solution[:, :, field_index].min(),
+                *(frame[:, :, field_index].min() for frame in frames),
+            )
+            maximum = max(
+                solution[:, :, field_index].max(),
+                *(frame[:, :, field_index].max() for frame in frames),
+            )
+            field_limits = _plot_limits(minimum, maximum)
+        else:
+            field_limits = _plot_limits(
+                frames[0][:, :, field_index].min(),
+                frames[0][:, :, field_index].max(),
+            )
+
+        approximation_axis = axes[0, field_index]
+        approximation_image = approximation_axis.imshow(
+            frames[0][:, :, field_index],
+            extent=(0, 1, 0, 1),
+            vmin=field_limits[0],
+            vmax=field_limits[1],
+        )
+        approximation_images.append(approximation_image)
+        fig.colorbar(approximation_image, ax=approximation_axis)
+        approximation_axis.set_title(f"Approximation: {variable}")
+        approximation_axis.set_xlabel("x")
+        approximation_axis.set_ylabel("y")
+        approximation_axis.margins(0)
+
+        if solution is not None:
+            solution_axis = axes[1, field_index]
+            solution_image = solution_axis.imshow(
+                solution[:, :, field_index],
+                extent=(0, 1, 0, 1),
+                vmin=field_limits[0],
+                vmax=field_limits[1],
+            )
+            fig.colorbar(solution_image, ax=solution_axis)
+            solution_axis.set_title(f"Solution: {variable}")
+            solution_axis.set_xlabel("x")
+            solution_axis.set_ylabel("y")
+            solution_axis.margins(0)
+
     fig.tight_layout()
 
-    def animate(i):
-        out = frames[i]
-        for k in range(out.shape[-1]):
-            z = out[:, :, k]
-            ims[k].set_data(z)
-            ims[k].set_clim(z.min(), z.max())
+    def animate(frame_index):
+        out = frames[frame_index]
+        for field_index, image_artist in enumerate(approximation_images):
+            z = out[:, :, field_index]
+            image_artist.set_data(z)
+            if solution is None:
+                image_artist.set_clim(*_plot_limits(z.min(), z.max()))
+        return approximation_images
 
     ani = FuncAnimation(fig, animate, frames=len(frames))
     pbar = trange(len(frames), desc="Generating GIF")
@@ -676,13 +803,19 @@ def make_gif(frames, vars, output_file):
         writer=PillowWriter(fps=len(frames) / 3),
         progress_callback=lambda i, n: pbar.update(1),
     )
+    pbar.close()
+    plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--input_file", "-i", type=str, help="input filename with one equation per line"
+        "--input_file",
+        "-i",
+        type=str,
+        required=True,
+        help="problem file containing '# Equations' and optional '# Solution' sections",
     )
     parser.add_argument(
         "--output_file", "-o", type=str, default="out.gif", help="output gif filename"
@@ -719,7 +852,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    equations, vars, domains = parse_equation_file(args.input_file)
+    equations, variables, domains, solution_functions = parse_problem_file(
+        args.input_file
+    )
     frames = []
 
     def collect_frame(iteration, model, loss_value):
@@ -736,7 +871,7 @@ if __name__ == "__main__":
 
     model = train_model(
         equations,
-        vars,
+        variables,
         domains,
         nb_iter=args.nb_iter,
         nb_samples=args.nb_samples,
@@ -750,4 +885,21 @@ if __name__ == "__main__":
     )
 
     if not args.no_gif:
-        make_gif(frames, vars, args.output_file)
+        solution = None
+        if solution_functions:
+            xy = torch.cartesian_prod(
+                torch.linspace(0, 1, args.resolution),
+                torch.linspace(0, 1, args.resolution),
+            ).to(args.device)
+            with torch.no_grad():
+                solution = evaluate_solution_functions(
+                    solution_functions,
+                    variables,
+                    xy[:, 0],
+                    xy[:, 1],
+                )
+            solution = solution.view(
+                args.resolution, args.resolution, len(variables)
+            )
+            solution = solution.rot90().cpu().numpy()
+        make_gif(frames, variables, args.output_file, solution=solution)
