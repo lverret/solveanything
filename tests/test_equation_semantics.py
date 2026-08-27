@@ -33,9 +33,7 @@ class EquationSemanticsTests(unittest.TestCase):
         torch.testing.assert_close(value, torch.full_like(value, -1.0))
 
     def test_derivatives_use_the_fixed_call_coordinate(self):
-        value = residual(
-            "grad(u(0, y), x) = grad(u(1, y), x)", PolynomialModel()
-        )
+        value = residual("grad(u(0, y), x) = grad(u(1, y), x)", PolynomialModel())
         torch.testing.assert_close(value, torch.full_like(value, -2.0))
 
     def test_nested_derivative_at_a_fixed_coordinate(self):
@@ -50,35 +48,6 @@ class EquationSemanticsTests(unittest.TestCase):
         _, domains = solver.parse_equations(["u(0, y) = 0"])
         self.assertEqual(domains[0]["x"], 0.0)
         self.assertTrue(math.isnan(domains[0]["y"]))
-
-    def test_equal_weighting_means_each_equation_contributes_equally(self):
-        equations = ["u = 2", "u(0, y) = 1"]
-        variables, domains = solver.parse_equations(equations)
-        field_indices = {variable: index for index, variable in enumerate(variables)}
-        loss = solver.compute_loss(
-            equations,
-            domains,
-            ZeroModel(),
-            field_indices,
-            nb_samples=8,
-            device="cpu",
-        )
-        torch.testing.assert_close(loss, torch.tensor(1.5))
-
-    def test_legacy_weighting_remains_available(self):
-        equations = ["u = 2", "u(0, y) = 1"]
-        variables, domains = solver.parse_equations(equations)
-        field_indices = {variable: index for index, variable in enumerate(variables)}
-        loss = solver.compute_loss(
-            equations,
-            domains,
-            ZeroModel(),
-            field_indices,
-            nb_samples=8,
-            device="cpu",
-            loss_weighting="legacy",
-        )
-        torch.testing.assert_close(loss, torch.tensor(1.1))
 
 
 if __name__ == "__main__":

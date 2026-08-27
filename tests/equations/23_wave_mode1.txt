@@ -1,0 +1,7 @@
+u(0, y) = sin(pi * y)
+grad(u(0, y), x) = 0
+u(x, 0) = 0
+u(x, 1) = 0
+grad(grad(u, x), x) = grad(grad(u, y), y)
+
+# Expected function: u = cos(pi * x) * sin(pi * y)

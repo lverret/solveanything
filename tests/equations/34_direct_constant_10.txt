@@ -1,0 +1,3 @@
+f = 10
+
+# Expected function: f = 10

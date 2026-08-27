@@ -1,0 +1,7 @@
+u(0, y) = 0
+u(1, y) = 0
+u(x, 0) = 0
+u(x, 1) = 0
+grad(grad(u, x), x) + grad(grad(u, y), y) = -2 * (4 * pi)**2 * sin(4 * pi * x) * sin(4 * pi * y)
+
+# Expected function: u = sin(4 * pi * x) * sin(4 * pi * y)

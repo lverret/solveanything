@@ -1,0 +1,3 @@
+f = sin(16 * pi * x) * sin(16 * pi * y)
+
+# Expected function: f = sin(16 * pi * x) * sin(16 * pi * y)
