@@ -1,4 +1,4 @@
-u(0, y) = sin(3.141592653589793 * y)
+u(0, y) = sin(pi * y)
 grad(u, x) = u
 
 # Expected function: u = exp(x) * sin(pi * y)

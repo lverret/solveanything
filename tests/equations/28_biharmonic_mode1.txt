@@ -6,6 +6,6 @@ grad(grad(u(0, y), x), x) + grad(grad(u(0, y), y), y) = 0
 grad(grad(u(1, y), x), x) + grad(grad(u(1, y), y), y) = 0
 grad(grad(u(x, 0), x), x) + grad(grad(u(x, 0), y), y) = 0
 grad(grad(u(x, 1), x), x) + grad(grad(u(x, 1), y), y) = 0
-grad(grad(grad(grad(u, x), x), x), x) + 2 * grad(grad(grad(grad(u, x), x), y), y) + grad(grad(grad(grad(u, y), y), y), y) = 4 * 3.141592653589793**4 * sin(3.141592653589793 * x) * sin(3.141592653589793 * y)
+grad(grad(grad(grad(u, x), x), x), x) + 2 * grad(grad(grad(grad(u, x), x), y), y) + grad(grad(grad(grad(u, y), y), y), y) = 4 * pi**4 * sin(pi * x) * sin(pi * y)
 
 # Expected function: u = sin(pi * x) * sin(pi * y)

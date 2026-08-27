@@ -1,5 +1,5 @@
-u(0, y) = sin(2 * 3.141592653589793 * y)
-u(x, 0) = -sin(2 * 3.141592653589793 * x)
+u(0, y) = sin(2 * pi * y)
+u(x, 0) = -sin(2 * pi * x)
 grad(u, x) + grad(u, y) = 0
 
 # Expected function: u = sin(2 * pi * (y - x))

@@ -40,7 +40,7 @@ SEED = 0
 GRID_RESOLUTION = 81
 MSE_TOLERANCE = 1e-2
 
-RUN_BENCHMARKS = os.environ.get("SOLVEANYTHING_RUN_BENCHMARKS") == "1"
+RUN_BENCHMARKS = 1  # os.environ.get("SOLVEANYTHING_RUN_BENCHMARKS") == "1"
 SELECTED_CASES = {
     case.strip()
     for case in os.environ.get("SOLVEANYTHING_CASES", "").split(",")
@@ -61,9 +61,7 @@ def train_and_measure_mse(path):
             f"{sorted(expected_functions)!r}"
         )
 
-    field_indices = {
-        variable: index for index, variable in enumerate(variables)
-    }
+    field_indices = {variable: index for index, variable in enumerate(variables)}
     model = train_model(
         equations,
         variables,

@@ -2,6 +2,6 @@ u(0, y) = 0
 u(1, y) = 0
 u(x, 0) = 0
 u(x, 1) = 0
-grad(grad(u, x), x) + grad(grad(u, y), y) + u = (1 - 2 * 3.141592653589793**2) * sin(3.141592653589793 * x) * sin(3.141592653589793 * y)
+grad(grad(u, x), x) + grad(grad(u, y), y) + u = (1 - 2 * pi**2) * sin(pi * x) * sin(pi * y)
 
 # Expected function: u = sin(pi * x) * sin(pi * y)
