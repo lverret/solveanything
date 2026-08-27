@@ -1,0 +1,5 @@
+# Equations
+f = sin(24 * pi * x) * sin(24 * pi * y)
+
+# Solution
+f = sin(24 * pi * x) * sin(24 * pi * y)

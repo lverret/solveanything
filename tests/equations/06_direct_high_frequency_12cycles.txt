@@ -1,3 +1,0 @@
-f = sin(24 * pi * x) * sin(24 * pi * y)
-
-# Expected function: f = sin(24 * pi * x) * sin(24 * pi * y)

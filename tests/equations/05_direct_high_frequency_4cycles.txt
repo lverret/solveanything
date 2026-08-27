@@ -1,3 +1,0 @@
-f = sin(8 * pi * x) * sin(8 * pi * y)
-
-# Expected function: f = sin(8 * pi * x) * sin(8 * pi * y)

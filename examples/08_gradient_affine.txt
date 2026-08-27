@@ -1,0 +1,7 @@
+# Equations
+grad(f, x) = 1
+grad(f, y) = -2
+f(0, 0) = 0.25
+
+# Solution
+f = 0.25 + x - 2 * y

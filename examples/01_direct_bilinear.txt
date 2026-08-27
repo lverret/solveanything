@@ -1,0 +1,5 @@
+# Equations
+f = x * y
+
+# Solution
+f = x * y

@@ -1,7 +1,0 @@
-u(x, 0) = x**2
-v(x, 0) = 0
-grad(u, x) = grad(v, y)
-grad(u, y) = -grad(v, x)
-
-# Expected function: u = x**2 - y**2
-# Expected function: v = 2 * x * y

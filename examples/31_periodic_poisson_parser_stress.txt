@@ -1,0 +1,10 @@
+# Equations
+u(0, y) = u(1, y)
+grad(u(0, y), x) = grad(u(1, y), x)
+u(x, 0) = u(x, 1)
+grad(u(x, 0), y) = grad(u(x, 1), y)
+u(0, 0) = 0
+grad(grad(u, x), x) + grad(grad(u, y), y) = -8 * pi**2 * sin(2 * pi * x) * sin(2 * pi * y)
+
+# Solution
+u = sin(2 * pi * x) * sin(2 * pi * y)

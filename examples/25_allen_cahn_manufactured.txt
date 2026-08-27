@@ -1,0 +1,8 @@
+# Equations
+u(0, y) = sin(pi * y)
+u(x, 0) = 0
+u(x, 1) = 0
+grad(u, x) - 0.01 * grad(grad(u, y), y) + u**3 - u = (0.01 * pi**2 - 2) * exp(-x) * sin(pi * y) + exp(-3 * x) * sin(pi * y)**3
+
+# Solution
+u = exp(-x) * sin(pi * y)

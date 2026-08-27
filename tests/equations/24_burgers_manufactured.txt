@@ -1,7 +1,0 @@
-u(0, y) = 0
-u(1, y) = y
-u(x, 0) = 0
-u(x, 1) = x
-grad(u, x) + u * grad(u, y) - 0.01 * grad(grad(u, y), y) = y + x**2 * y
-
-# Expected function: u = x * y

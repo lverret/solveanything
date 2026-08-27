@@ -1,0 +1,6 @@
+# Equations
+u(0, y) = sin(pi * y)
+grad(u, x) = u
+
+# Solution
+u = exp(x) * sin(pi * y)

@@ -1,7 +1,0 @@
-u(0, y) = sin(pi * y)
-v(0, y) = 0
-grad(u, x) = v
-grad(v, x) = -u
-
-# Expected function: u = cos(x) * sin(pi * y)
-# Expected function: v = -sin(x) * sin(pi * y)

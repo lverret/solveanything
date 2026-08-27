@@ -1,0 +1,8 @@
+# Equations
+T(0, y) = sin(pi * y)
+T(x, 0) = 0
+T(x, 1) = 0
+grad(T, x) = 0.1 * grad(grad(T, y), y)
+
+# Solution
+T = exp(-0.1 * pi**2 * x) * sin(pi * y)
