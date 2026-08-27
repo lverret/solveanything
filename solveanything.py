@@ -232,6 +232,264 @@ class Siren(torch.nn.Module):
         return outputs
 
 
+def _activation(name):
+    """Return an activation module used by the configurable model factory."""
+    activations = {
+        "tanh": torch.nn.Tanh,
+        "gelu": torch.nn.GELU,
+        "silu": torch.nn.SiLU,
+    }
+    try:
+        return activations[name.lower()]()
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown activation {name!r}; choose from {sorted(activations)}"
+        ) from error
+
+
+class WeightFactorizedLinear(torch.nn.Module):
+    """Linear layer with trainable row scale and direction parameters."""
+
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        initial = torch.empty(out_features, in_features)
+        torch.nn.init.kaiming_uniform_(initial, a=np.sqrt(5))
+        norms = initial.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        self.direction = torch.nn.Parameter(initial / norms)
+        self.log_scale = torch.nn.Parameter(norms.log())
+        if bias:
+            bound = 1 / np.sqrt(in_features)
+            self.bias = torch.nn.Parameter(
+                torch.empty(out_features).uniform_(-bound, bound)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, value):
+        weight = self.direction * self.log_scale.exp()
+        return F.linear(value, weight, self.bias)
+
+
+class MLP(torch.nn.Module):
+    """A coordinate MLP with optional random weight factorization."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+        random_weight_factorization=False,
+    ):
+        super().__init__()
+        linear = (
+            WeightFactorizedLinear if random_weight_factorization else torch.nn.Linear
+        )
+        layers = [linear(in_features, hidden_features), _activation(activation)]
+        for _ in range(max(0, hidden_layers - 1)):
+            layers.extend(
+                [linear(hidden_features, hidden_features), _activation(activation)]
+            )
+        layers.append(linear(hidden_features, out_features))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x, y):
+        return self.net(torch.cat([x, y], dim=-1))
+
+
+class FourierFeatureMLP(torch.nn.Module):
+    """Tanh MLP preceded by a frozen Gaussian Fourier feature map."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        fourier_features=64,
+        fourier_sigma=2.0,
+        activation="tanh",
+    ):
+        super().__init__()
+        self.register_buffer(
+            "projection",
+            torch.randn(in_features, fourier_features) * float(fourier_sigma),
+        )
+        self.mlp = MLP(
+            2 * fourier_features,
+            hidden_features,
+            hidden_layers,
+            out_features,
+            activation=activation,
+        )
+
+    def forward(self, x, y):
+        coordinates = torch.cat([x, y], dim=-1)
+        phase = 2 * np.pi * coordinates @ self.projection
+        features = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
+        midpoint = features.size(-1) // 2
+        return self.mlp(features[:, :midpoint], features[:, midpoint:])
+
+
+class ModifiedMLP(torch.nn.Module):
+    """Gated MLP used in the PINN gradient-pathology literature."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+    ):
+        super().__init__()
+        self.activation = _activation(activation)
+        self.encoder_u = torch.nn.Linear(in_features, hidden_features)
+        self.encoder_v = torch.nn.Linear(in_features, hidden_features)
+        self.input_layer = torch.nn.Linear(in_features, hidden_features)
+        self.hidden = torch.nn.ModuleList(
+            torch.nn.Linear(hidden_features, hidden_features)
+            for _ in range(max(0, hidden_layers - 1))
+        )
+        self.output_layer = torch.nn.Linear(hidden_features, out_features)
+
+    def forward(self, x, y):
+        coordinates = torch.cat([x, y], dim=-1)
+        encoder_u = self.activation(self.encoder_u(coordinates))
+        encoder_v = self.activation(self.encoder_v(coordinates))
+        hidden = self.activation(self.input_layer(coordinates))
+        for layer in self.hidden:
+            gate = self.activation(layer(hidden))
+            hidden = (1 - gate) * encoder_u + gate * encoder_v
+        return self.output_layer(hidden)
+
+
+class PirateNet(torch.nn.Module):
+    """Compact physics-informed residual network with zero-initialized blocks."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+    ):
+        super().__init__()
+        self.activation = _activation(activation)
+        self.input_layer = torch.nn.Linear(in_features, hidden_features)
+        self.blocks = torch.nn.ModuleList()
+        self.residual_scales = torch.nn.ParameterList()
+        for _ in range(hidden_layers):
+            self.blocks.append(
+                torch.nn.Sequential(
+                    torch.nn.Linear(hidden_features, hidden_features),
+                    _activation(activation),
+                    torch.nn.Linear(hidden_features, hidden_features),
+                    _activation(activation),
+                )
+            )
+            self.residual_scales.append(torch.nn.Parameter(torch.zeros(())))
+        self.output_layer = torch.nn.Linear(hidden_features, out_features)
+
+    def forward(self, x, y):
+        hidden = self.activation(self.input_layer(torch.cat([x, y], dim=-1)))
+        for block, scale in zip(self.blocks, self.residual_scales):
+            hidden = hidden + scale * block(hidden)
+        return self.output_layer(hidden)
+
+
+class MultiHeadMLP(torch.nn.Module):
+    """Coordinate MLP with a shared trunk and one scalar head per field."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+    ):
+        super().__init__()
+        layers = [
+            torch.nn.Linear(in_features, hidden_features),
+            _activation(activation),
+        ]
+        for _ in range(max(0, hidden_layers - 1)):
+            layers.extend(
+                [
+                    torch.nn.Linear(hidden_features, hidden_features),
+                    _activation(activation),
+                ]
+            )
+        self.trunk = torch.nn.Sequential(*layers)
+        self.heads = torch.nn.ModuleList(
+            torch.nn.Linear(hidden_features, 1) for _ in range(out_features)
+        )
+
+    def forward(self, x, y):
+        hidden = self.trunk(torch.cat([x, y], dim=-1))
+        return torch.cat([head(hidden) for head in self.heads], dim=-1)
+
+
+def build_model(
+    architecture,
+    in_features,
+    hidden_features,
+    hidden_layers,
+    out_features,
+    first_omega_0=10.0,
+    hidden_omega_0=30.0,
+    activation="tanh",
+    fourier_features=64,
+    fourier_sigma=2.0,
+):
+    """Build one of the coordinate-network backbones used by experiments."""
+    architecture = architecture.lower()
+    common = dict(
+        in_features=in_features,
+        hidden_features=hidden_features,
+        hidden_layers=hidden_layers,
+        out_features=out_features,
+    )
+    if architecture == "siren":
+        model = Siren(
+            **common,
+            first_omega_0=first_omega_0,
+            hidden_omega_0=hidden_omega_0,
+        )
+    elif architecture == "mlp":
+        model = MLP(**common, activation=activation)
+    elif architecture == "rwf_mlp":
+        model = MLP(
+            **common,
+            activation=activation,
+            random_weight_factorization=True,
+        )
+    elif architecture == "fourier_mlp":
+        model = FourierFeatureMLP(
+            **common,
+            activation=activation,
+            fourier_features=fourier_features,
+            fourier_sigma=fourier_sigma,
+        )
+    elif architecture == "modified_mlp":
+        model = ModifiedMLP(**common, activation=activation)
+    elif architecture == "piratenet":
+        model = PirateNet(**common, activation=activation)
+    elif architecture == "multihead_mlp":
+        model = MultiHeadMLP(**common, activation=activation)
+    else:
+        raise ValueError(
+            "Unknown architecture {!r}; choose siren, mlp, rwf_mlp, "
+            "fourier_mlp, modified_mlp, piratenet, or multihead_mlp".format(
+                architecture
+            )
+        )
+    return model
+
+
 # -----------------------------------------------------------------------------
 # Helper mathematical functions for defining the equations to solve
 
@@ -890,7 +1148,94 @@ def evaluate_solution_functions(solution_functions, variables, x, y):
 # Training and visualization functions
 
 
-def generate_samples(domain, nb_samples, device, requires_grad=True):
+def _domain_key(domain):
+    return tuple(
+        None if np.isnan(domain[coordinate]) else float(domain[coordinate])
+        for coordinate in ("x", "y")
+    )
+
+
+class CollocationSampler:
+    """Reusable IID, scrambled Sobol, fixed Sobol, or wall-mixture sampler."""
+
+    def __init__(self, method="iid", seed=0, wall_fraction=0.5, wall_width=0.1):
+        if method not in {"iid", "sobol", "fixed_sobol", "wall_mixture"}:
+            raise ValueError(f"Unknown sampling method {method!r}")
+        self.method = method
+        self.seed = int(seed)
+        self.wall_fraction = float(wall_fraction)
+        self.wall_width = float(wall_width)
+        self._engines = {}
+        self._fixed_samples = {}
+
+    def _unit_samples(self, domain, nb_samples):
+        key = _domain_key(domain)
+        free_coordinates = sum(value is None for value in key)
+        if not free_coordinates:
+            return torch.empty(nb_samples, 0)
+        if self.method == "iid":
+            engine_key = ("iid", key)
+            generator = self._engines.setdefault(
+                engine_key,
+                torch.Generator().manual_seed(self.seed + len(self._engines)),
+            )
+            return torch.rand(nb_samples, free_coordinates, generator=generator)
+        engine_key = ("sobol", key)
+        engine = self._engines.setdefault(
+            engine_key,
+            torch.quasirandom.SobolEngine(
+                free_coordinates,
+                scramble=True,
+                seed=self.seed + len(self._engines),
+            ),
+        )
+        return engine.draw(nb_samples)
+
+    def sample(self, domain, nb_samples, device, requires_grad=True):
+        key = (_domain_key(domain), int(nb_samples))
+        if self.method == "fixed_sobol" and key in self._fixed_samples:
+            unit = self._fixed_samples[key].clone()
+        else:
+            unit = self._unit_samples(domain, nb_samples)
+            if self.method == "fixed_sobol":
+                self._fixed_samples[key] = unit.clone()
+
+        if self.method == "wall_mixture" and all(
+            np.isnan(domain[coordinate]) for coordinate in ("x", "y")
+        ):
+            wall_count = min(nb_samples, round(nb_samples * self.wall_fraction))
+            if wall_count:
+                generator_key = ("wall", _domain_key(domain))
+                generator = self._engines.setdefault(
+                    generator_key, torch.Generator().manual_seed(self.seed + 7919)
+                )
+                axis = torch.randint(0, 2, (wall_count,), generator=generator)
+                side = torch.randint(0, 2, (wall_count,), generator=generator)
+                distance = (
+                    torch.rand(wall_count, generator=generator).square()
+                    * self.wall_width
+                )
+                rows = torch.arange(wall_count)
+                unit[rows, axis] = torch.where(side.bool(), 1 - distance, distance)
+
+        unit = unit.to(device=device)
+        samples = {}
+        free_index = 0
+        for coordinate in ("x", "y"):
+            if np.isnan(domain[coordinate]):
+                value = unit[:, free_index : free_index + 1]
+                free_index += 1
+            else:
+                value = torch.full(
+                    (nb_samples, 1), float(domain[coordinate]), device=device
+                )
+            samples[coordinate] = value.detach().requires_grad_(requires_grad)
+        return samples
+
+
+def generate_samples(domain, nb_samples, device, requires_grad=True, sampler=None):
+    if sampler is not None:
+        return sampler.sample(domain, nb_samples, device, requires_grad)
     samples = {"x": None, "y": None}
     for inp in ["x", "y"]:
         if np.isnan(domain[inp]):
@@ -923,7 +1268,8 @@ def _requires_autograd_derivatives(node, field_indices, analytic_derivatives):
     )
 
 
-def _compile_residuals(equations, field_indices, model):
+def compile_residuals(equations, field_indices, model):
+    """Parse equations once and annotate their derivative requirements."""
     analytic_derivatives = hasattr(model, "forward_with_derivatives")
     residuals = []
     for formula in equations:
@@ -939,6 +1285,140 @@ def _compile_residuals(equations, field_indices, model):
             )
         )
     return residuals
+
+
+def _compile_residuals(equations, field_indices, model):
+    """Backward-compatible alias for :func:`compile_residuals`."""
+    return compile_residuals(equations, field_indices, model)
+
+
+def _merged_derivative_requests(residuals):
+    requests = {}
+    for _, derivative_requests, _ in residuals:
+        for coordinate_signature, orders in derivative_requests.items():
+            requests.setdefault(coordinate_signature, set()).update(orders)
+    return {
+        coordinate_signature: tuple(sorted(orders))
+        for coordinate_signature, orders in requests.items()
+    }
+
+
+def evaluate_residuals(
+    residuals,
+    domains,
+    model,
+    field_indices,
+    nb_samples,
+    device,
+    sampler=None,
+    grouped=True,
+):
+    """Evaluate equation residuals, optionally sharing samples/model passes.
+
+    The returned list contains ``(residual_tensor, samples)`` pairs in equation
+    order. Equations on the same geometric domain share both a collocation set
+    and an evaluation cache when ``grouped`` is true.
+    """
+    if len(residuals) != len(domains):
+        raise ValueError("Residual and domain counts do not match")
+    if isinstance(nb_samples, int):
+        sample_counts = [nb_samples] * len(residuals)
+    else:
+        sample_counts = list(nb_samples)
+        if len(sample_counts) != len(residuals):
+            raise ValueError("Sample-count and residual counts do not match")
+    if grouped:
+        grouped_indices = {}
+        for index, domain in enumerate(domains):
+            grouped_indices.setdefault(_domain_key(domain), []).append(index)
+        groups = list(grouped_indices.values())
+    else:
+        groups = [[index] for index in range(len(residuals))]
+
+    evaluations = [None] * len(residuals)
+    for indices in groups:
+        group_residuals = [residuals[index] for index in indices]
+        group_counts = {int(sample_counts[index]) for index in indices}
+        if len(group_counts) != 1:
+            raise ValueError(
+                "Equations grouped on one domain must use the same sample count"
+            )
+        group_sample_count = group_counts.pop()
+        requires_grad = any(item[2] for item in group_residuals)
+        samples = generate_samples(
+            domains[indices[0]],
+            group_sample_count,
+            device,
+            requires_grad=requires_grad,
+            sampler=sampler,
+        )
+        evaluation_cache = {
+            "model_outputs": {},
+            "derivative_outputs": {},
+            "derivative_requests": _merged_derivative_requests(group_residuals),
+        }
+        coordinate_cache = {}
+        for index in indices:
+            node = residuals[index][0]
+            value = evaluate(
+                node,
+                samples,
+                model,
+                field_indices,
+                coordinate_cache=coordinate_cache,
+                evaluation_cache=evaluation_cache,
+            )
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, dtype=torch.float32, device=device)
+                value = value.expand(group_sample_count, 1)
+            evaluations[index] = (value, samples)
+    return evaluations
+
+
+def reduce_residual(residual, penalty="mae", huber_delta=0.01, weights=None):
+    """Reduce a pointwise residual using a PINN training penalty."""
+    if penalty == "mae":
+        values = residual.abs()
+    elif penalty == "mse":
+        values = residual.square()
+    elif penalty in {"huber", "pseudo_huber"}:
+        delta = float(huber_delta)
+        values = delta**2 * (torch.sqrt(1 + (residual / delta).square()) - 1)
+    else:
+        raise ValueError(f"Unknown residual penalty {penalty!r}")
+    if weights is not None:
+        values = values * weights
+    return values.mean()
+
+
+def compute_equation_losses(
+    residuals,
+    domains,
+    model,
+    field_indices,
+    nb_samples,
+    device,
+    sampler=None,
+    grouped=True,
+    penalty="mae",
+    huber_delta=0.01,
+):
+    """Return one reduced loss and one raw evaluation per equation."""
+    evaluations = evaluate_residuals(
+        residuals,
+        domains,
+        model,
+        field_indices,
+        nb_samples,
+        device,
+        sampler=sampler,
+        grouped=grouped,
+    )
+    losses = [
+        reduce_residual(value, penalty=penalty, huber_delta=huber_delta)
+        for value, _ in evaluations
+    ]
+    return losses, evaluations
 
 
 def compute_loss(
