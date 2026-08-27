@@ -34,6 +34,10 @@ visual comparison and benchmarking; it never participates in training.
 The 36 files in [`examples`](examples) cover direct functions, gradients,
 ODEs, PDEs, nonlinear equations, coupled fields, and higher-frequency cases.
 
+For SIREN models, pure derivatives in `x` or `y` through fourth order are
+propagated exactly through the network layers in one batched pass. Mixed or
+higher-order expressions automatically fall back to PyTorch autograd.
+
 ## Solve a problem
 
 ```bash

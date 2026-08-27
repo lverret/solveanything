@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import operator
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
 from inspect import signature
 from tqdm import trange
@@ -45,6 +46,38 @@ class SineLayer(torch.nn.Module):
         return torch.sin(self.omega_0 * self.linear(input))
 
 
+MAX_ANALYTIC_DERIVATIVE_ORDER = 4
+
+
+def _sine_derivatives(argument_derivatives, sine, cosine):
+    """Apply ``sin`` to pure spatial derivatives through fourth order."""
+    derivatives = [sine]
+
+    if len(argument_derivatives) > 1:
+        first = argument_derivatives[1]
+        derivatives.append(cosine * first)
+    if len(argument_derivatives) > 2:
+        second = argument_derivatives[2]
+        derivatives.append(cosine * second - sine * first.square())
+    if len(argument_derivatives) > 3:
+        third = argument_derivatives[3]
+        derivatives.append(
+            cosine * third
+            - 3 * sine * first * second
+            - cosine * first.pow(3)
+        )
+    if len(argument_derivatives) > 4:
+        fourth = argument_derivatives[4]
+        derivatives.append(
+            cosine * fourth
+            - 4 * sine * first * third
+            - 3 * sine * second.square()
+            - 6 * cosine * first.square() * second
+            + sine * first.pow(4)
+        )
+    return derivatives
+
+
 class Siren(torch.nn.Module):
     def __init__(
         self,
@@ -83,6 +116,120 @@ class Siren(torch.nn.Module):
 
     def forward(self, x, y):
         return self.net(torch.cat([x, y], dim=-1))
+
+    def forward_with_derivatives(self, x, y, derivative_orders):
+        """Evaluate outputs and requested pure derivatives in one forward pass.
+
+        SIREN derivatives can be propagated exactly through each linear and
+        sine layer. This avoids constructing nested ``autograd.grad`` graphs,
+        while ordinary autograd still computes parameter gradients from the
+        resulting residual loss.
+        """
+        derivative_orders = tuple(
+            dict.fromkeys(
+                order for order in derivative_orders if order != (0, 0)
+            )
+        )
+        if any(
+            x_order and y_order
+            or max(x_order, y_order) > MAX_ANALYTIC_DERIVATIVE_ORDER
+            for x_order, y_order in derivative_orders
+        ):
+            raise ValueError("Only pure derivatives through fourth order are supported")
+
+        max_x_order = max(
+            (x_order for x_order, _ in derivative_orders), default=0
+        )
+        max_y_order = max(
+            (y_order for _, y_order in derivative_orders), default=0
+        )
+        value = torch.cat([x, y], dim=-1)
+        x_derivatives = [value]
+        y_derivatives = [value]
+        if max_x_order:
+            x_derivatives.extend(
+                [
+                    torch.cat([torch.ones_like(x), torch.zeros_like(y)], dim=-1),
+                    *[
+                        torch.zeros_like(value)
+                        for _ in range(max_x_order - 1)
+                    ],
+                ]
+            )
+        if max_y_order:
+            y_derivatives.extend(
+                [
+                    torch.cat([torch.zeros_like(x), torch.ones_like(y)], dim=-1),
+                    *[
+                        torch.zeros_like(value)
+                        for _ in range(max_y_order - 1)
+                    ],
+                ]
+            )
+
+        batch_size = value.size(0)
+        for layer in self.net[:-1]:
+            derivative_inputs = [
+                value,
+                *x_derivatives[1:],
+                *y_derivatives[1:],
+            ]
+            transformed = F.linear(
+                torch.cat(derivative_inputs, dim=0), layer.linear.weight
+            ).split(batch_size, dim=0)
+            argument = layer.omega_0 * (transformed[0] + layer.linear.bias)
+            sine = torch.sin(argument)
+            cosine = torch.cos(argument)
+            offset = 1
+
+            if max_x_order:
+                x_arguments = [
+                    argument,
+                    *(
+                        layer.omega_0 * derivative
+                        for derivative in transformed[
+                            offset : offset + max_x_order
+                        ]
+                    ),
+                ]
+                x_derivatives = _sine_derivatives(x_arguments, sine, cosine)
+                value = x_derivatives[0]
+                offset += max_x_order
+            if max_y_order:
+                y_arguments = [
+                    argument,
+                    *(
+                        layer.omega_0 * derivative
+                        for derivative in transformed[
+                            offset : offset + max_y_order
+                        ]
+                    ),
+                ]
+                y_derivatives = _sine_derivatives(y_arguments, sine, cosine)
+                value = y_derivatives[0]
+            if not max_x_order and not max_y_order:
+                value = sine
+
+            x_derivatives[0] = value
+            y_derivatives[0] = value
+
+        final_layer = self.net[-1]
+        requested_inputs = [value]
+        for x_order, y_order in derivative_orders:
+            requested_inputs.append(
+                x_derivatives[x_order] if x_order else y_derivatives[y_order]
+            )
+        transformed = F.linear(
+            torch.cat(requested_inputs, dim=0), final_layer.weight
+        ).split(batch_size, dim=0)
+        outputs = {(0, 0): transformed[0] + final_layer.bias}
+        outputs.update(
+            {
+                order: derivative
+                for order, derivative in zip(derivative_orders, transformed[1:])
+            }
+        )
+        return outputs
 
 
 # -----------------------------------------------------------------------------
@@ -413,7 +560,9 @@ def _coordinate_value(node, coordinate, samples, coordinate_cache, used_coordina
         key = (coordinate, float(node.value))
         if key not in coordinate_cache:
             coordinate_cache[key] = torch.full_like(
-                samples[coordinate], float(node.value), requires_grad=True
+                samples[coordinate],
+                float(node.value),
+                requires_grad=samples[coordinate].requires_grad,
             )
         value = coordinate_cache[key]
     else:
@@ -428,6 +577,81 @@ def _merge_coordinates(source, destination):
             _record_coordinate(destination, coordinate, value)
 
 
+def _coordinate_signature(coordinate_nodes):
+    return tuple(
+        ast.dump(node, annotate_fields=False, include_attributes=False)
+        for node in coordinate_nodes
+    )
+
+
+def _direct_field_derivative(node, field_indices):
+    """Return a direct field derivative without evaluating its AST."""
+    derivative_order = [0, 0]
+    while (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "grad"
+    ):
+        coordinate_node = node.args[1]
+        if not isinstance(coordinate_node, ast.Name) or coordinate_node.id not in (
+            "x",
+            "y",
+        ):
+            return None
+        coordinate_index = 0 if coordinate_node.id == "x" else 1
+        derivative_order[coordinate_index] += 1
+        node = node.args[0]
+
+    if not any(derivative_order):
+        return None
+    if isinstance(node, ast.Name) and node.id in field_indices:
+        field = node.id
+        coordinate_nodes = (
+            ast.Name(id="x", ctx=ast.Load()),
+            ast.Name(id="y", ctx=ast.Load()),
+        )
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in field_indices
+        and len(node.args) == 2
+    ):
+        field = node.func.id
+        coordinate_nodes = tuple(node.args)
+    else:
+        return None
+
+    return field, coordinate_nodes, tuple(derivative_order)
+
+
+def _supports_analytic_derivative(derivative_order):
+    x_order, y_order = derivative_order
+    return (
+        not (x_order and y_order)
+        and max(derivative_order) <= MAX_ANALYTIC_DERIVATIVE_ORDER
+    )
+
+
+def _collect_derivative_requests(node, field_indices):
+    requests = {}
+
+    def visit(child):
+        derivative = _direct_field_derivative(child, field_indices)
+        if derivative is not None and _supports_analytic_derivative(derivative[2]):
+            _, coordinate_nodes, derivative_order = derivative
+            signature = _coordinate_signature(coordinate_nodes)
+            requests.setdefault(signature, set()).add(derivative_order)
+            return
+        for grandchild in ast.iter_child_nodes(child):
+            visit(grandchild)
+
+    visit(node)
+    return {
+        signature: tuple(sorted(orders))
+        for signature, orders in requests.items()
+    }
+
+
 def evaluate(
     node,
     samples,
@@ -435,11 +659,53 @@ def evaluate(
     field_indices,
     coordinate_cache=None,
     used_coordinates=None,
+    evaluation_cache=None,
 ):
     if coordinate_cache is None:
         coordinate_cache = {}
     if used_coordinates is None:
         used_coordinates = {"x": [], "y": []}
+    if evaluation_cache is None:
+        evaluation_cache = {
+            "model_outputs": {},
+            "derivative_outputs": {},
+            "derivative_requests": {},
+        }
+    model_cache = evaluation_cache["model_outputs"]
+    derivative_cache = evaluation_cache["derivative_outputs"]
+    derivative_requests = evaluation_cache["derivative_requests"]
+
+    direct_derivative = _direct_field_derivative(node, field_indices)
+    if (
+        direct_derivative is not None
+        and _supports_analytic_derivative(direct_derivative[2])
+        and hasattr(model, "forward_with_derivatives")
+    ):
+        field, coordinate_nodes, derivative_order = direct_derivative
+        coordinates = [
+            _coordinate_value(
+                coordinate_node,
+                coordinate,
+                samples,
+                coordinate_cache,
+                used_coordinates,
+            )
+            for coordinate, coordinate_node in zip(["x", "y"], coordinate_nodes)
+        ]
+        signature = _coordinate_signature(coordinate_nodes)
+        requested_orders = derivative_requests.get(
+            signature, (derivative_order,)
+        )
+        cache_key = tuple(coordinates)
+        if cache_key not in derivative_cache:
+            derivative_cache[cache_key] = model.forward_with_derivatives(
+                *coordinates, requested_orders
+            )
+            model_cache[cache_key] = derivative_cache[cache_key][(0, 0)]
+        field_index = field_indices[field]
+        return derivative_cache[cache_key][derivative_order][
+            :, field_index : field_index + 1
+        ]
 
     if isinstance(node, ast.Constant):
         return node.value
@@ -452,6 +718,7 @@ def evaluate(
                 field_indices,
                 coordinate_cache,
                 used_coordinates,
+                evaluation_cache,
             )
         )
     elif isinstance(node, ast.BinOp) and type(node.op) in OPS:
@@ -463,6 +730,7 @@ def evaluate(
                 field_indices,
                 coordinate_cache,
                 used_coordinates,
+                evaluation_cache,
             ),
             evaluate(
                 node.right,
@@ -471,6 +739,7 @@ def evaluate(
                 field_indices,
                 coordinate_cache,
                 used_coordinates,
+                evaluation_cache,
             ),
         )
     elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
@@ -491,6 +760,7 @@ def evaluate(
                 field_indices,
                 coordinate_cache,
                 local_coordinates,
+                evaluation_cache,
             )
             targets = local_coordinates[coordinate]
             if not targets:
@@ -522,6 +792,7 @@ def evaluate(
                         field_indices,
                         coordinate_cache,
                         used_coordinates,
+                        evaluation_cache,
                     )
                     for arg in node.args
                 )
@@ -538,7 +809,21 @@ def evaluate(
                 for coordinate, arg in zip(["x", "y"], node.args)
             ]
             field_index = field_indices[function_name]
-            return model(*coordinates)[:, field_index : field_index + 1]
+            cache_key = tuple(coordinates)
+            signature = _coordinate_signature(node.args)
+            requested_orders = derivative_requests.get(signature)
+            if (
+                requested_orders
+                and cache_key not in derivative_cache
+                and hasattr(model, "forward_with_derivatives")
+            ):
+                derivative_cache[cache_key] = model.forward_with_derivatives(
+                    *coordinates, requested_orders
+                )
+                model_cache[cache_key] = derivative_cache[cache_key][(0, 0)]
+            if cache_key not in model_cache:
+                model_cache[cache_key] = model(*coordinates)
+            return model_cache[cache_key][:, field_index : field_index + 1]
     elif isinstance(node, ast.Name):
         if node.id in samples:
             if node.id in ["x", "y"]:
@@ -561,6 +846,7 @@ def evaluate(
                 field_indices,
                 coordinate_cache,
                 used_coordinates,
+                evaluation_cache,
             )
     raise RuntimeError(f"Unsupported expression: {ast.dump(node)}")
 
@@ -604,15 +890,55 @@ def evaluate_solution_functions(solution_functions, variables, x, y):
 # Training and visualization functions
 
 
-def generate_samples(domain, nb_samples, device):
+def generate_samples(domain, nb_samples, device, requires_grad=True):
     samples = {"x": None, "y": None}
     for inp in ["x", "y"]:
         if np.isnan(domain[inp]):
-            samples[inp] = torch.rand(nb_samples, 1)
+            samples[inp] = torch.rand(nb_samples, 1, device=device)
         else:
-            samples[inp] = torch.ones(nb_samples, 1) * domain[inp]
-        samples[inp] = samples[inp].clone().detach().requires_grad_(True).to(device)
+            samples[inp] = torch.full(
+                (nb_samples, 1), float(domain[inp]), device=device
+            )
+        samples[inp].requires_grad_(requires_grad)
     return samples
+
+
+def _requires_autograd_derivatives(node, field_indices, analytic_derivatives):
+    derivative = _direct_field_derivative(node, field_indices)
+    if (
+        analytic_derivatives
+        and derivative is not None
+        and _supports_analytic_derivative(derivative[2])
+    ):
+        return False
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "grad"
+    ):
+        return True
+    return any(
+        _requires_autograd_derivatives(child, field_indices, analytic_derivatives)
+        for child in ast.iter_child_nodes(node)
+    )
+
+
+def _compile_residuals(equations, field_indices, model):
+    analytic_derivatives = hasattr(model, "forward_with_derivatives")
+    residuals = []
+    for formula in equations:
+        lhs, rhs = formula.split("=")
+        node = ast.parse(f"{lhs} - ({rhs})".strip(), mode="eval").body
+        residuals.append(
+            (
+                node,
+                _collect_derivative_requests(node, field_indices),
+                _requires_autograd_derivatives(
+                    node, field_indices, analytic_derivatives
+                ),
+            )
+        )
+    return residuals
 
 
 def compute_loss(
@@ -622,16 +948,32 @@ def compute_loss(
     field_indices,
     nb_samples,
     device,
+    residuals=None,
 ):
+    if residuals is None:
+        residuals = _compile_residuals(equations, field_indices, model)
     losses = []
-    for formula, domain in zip(equations, domains):
-        lhs, rhs = formula.split("=")
-        samples = generate_samples(domain, nb_samples, device)
+    for (
+        node,
+        derivative_requests,
+        requires_coordinate_gradients,
+    ), domain in zip(residuals, domains):
+        samples = generate_samples(
+            domain,
+            nb_samples,
+            device,
+            requires_grad=requires_coordinate_gradients,
+        )
         res = evaluate(
-            ast.parse(f"{lhs} - ({rhs})".strip(), mode="eval").body,
+            node,
             samples,
             model,
             field_indices,
+            evaluation_cache={
+                "model_outputs": {},
+                "derivative_outputs": {},
+                "derivative_requests": derivative_requests,
+            },
         )
         equation_loss = torch.mean(torch.abs(res))
         weight = 0.1 if np.isnan(domain["x"]) and np.isnan(domain["y"]) else 0.9
@@ -672,6 +1014,7 @@ def train_model(
         first_omega_0=first_omega_0,
         hidden_omega_0=hidden_omega_0,
     ).to(device)
+    residuals = _compile_residuals(equations, field_indices, model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
@@ -691,6 +1034,7 @@ def train_model(
             field_indices,
             nb_samples,
             device,
+            residuals,
         )
         if not torch.isfinite(loss):
             raise RuntimeError(
@@ -856,15 +1200,19 @@ if __name__ == "__main__":
         args.input_file
     )
     frames = []
+    frame_coordinates = None
+    if not args.no_gif:
+        frame_coordinates = torch.cartesian_prod(
+            torch.linspace(0, 1, args.resolution),
+            torch.linspace(0, 1, args.resolution),
+        ).to(args.device)
 
     def collect_frame(iteration, model, loss_value):
         if iteration % max(1, (args.nb_iter // args.nb_frames)) == 0:
-            xy = torch.cartesian_prod(
-                torch.linspace(0, 1, args.resolution),
-                torch.linspace(0, 1, args.resolution),
-            ).to(args.device)
             with torch.no_grad():
-                out = model(xy[:, 0:1], xy[:, 1:2])
+                out = model(
+                    frame_coordinates[:, 0:1], frame_coordinates[:, 1:2]
+                )
             out = out.view(args.resolution, args.resolution, out.size(-1))
             out = out.rot90().cpu().numpy()
             frames.append(out)
@@ -887,16 +1235,12 @@ if __name__ == "__main__":
     if not args.no_gif:
         solution = None
         if solution_functions:
-            xy = torch.cartesian_prod(
-                torch.linspace(0, 1, args.resolution),
-                torch.linspace(0, 1, args.resolution),
-            ).to(args.device)
             with torch.no_grad():
                 solution = evaluate_solution_functions(
                     solution_functions,
                     variables,
-                    xy[:, 0],
-                    xy[:, 1],
+                    frame_coordinates[:, 0],
+                    frame_coordinates[:, 1],
                 )
             solution = solution.view(
                 args.resolution, args.resolution, len(variables)
