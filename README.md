@@ -92,6 +92,9 @@ Every case runs in an isolated process with a hard wall-clock limit of at most
 after every case to resumable `results.json` and `results.csv` files under
 `benchmark_results/lid_driven_cavity_re100`. Matching successful cases are
 skipped on a later invocation unless `--no-resume` is supplied.
+Each successful case also saves its final `u`, `v`, and `p` fields as
+`plots/<case-id>.png`, using the same orientation, labels, and field layout as
+the solver GIF.
 
 The sole ranking metric is
 

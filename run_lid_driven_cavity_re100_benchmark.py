@@ -30,6 +30,7 @@ from solveanything import (
     compile_residuals,
     compute_equation_losses,
     compute_loss,
+    make_static_plot,
     parse_equations,
     parse_problem_file,
     reduce_residual,
@@ -41,6 +42,7 @@ DEFAULT_INPUT = SCRIPT_DIR / "examples" / "37_lid_driven_cavity_re100.txt"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "benchmark_results" / "lid_driven_cavity_re100"
 MAX_SECONDS_ALLOWED = 200.0
 MAX_VRAM_GB_ALLOWED = 8.0
+FINAL_PLOT_RESOLUTION = 128
 RESULT_SCHEMA_VERSION = 1
 
 # Tables I and II at Re=100 from Ghia, Ghia & Shin (JCP 48, 1982).
@@ -1239,6 +1241,7 @@ def save_results(payload, output_dir):
         "seed",
         "inherited_from",
         "fingerprint",
+        "plot_file",
         "error",
     ]
     with open(output_dir / "results.csv", "w", encoding="utf-8", newline="") as handle:
@@ -1287,9 +1290,28 @@ def run_worker(spec_path):
             device,
             absolute_deadline=spec["absolute_deadline"],
         )
+        axis = torch.linspace(
+            0.0,
+            1.0,
+            FINAL_PLOT_RESOLUTION,
+            device=device,
+        )
+        x, y = torch.meshgrid(axis, axis, indexing="ij")
+        model.eval()
+        with torch.no_grad():
+            final_frame = model(
+                x.reshape(-1, 1), y.reshape(-1, 1)
+            ).reshape(FINAL_PLOT_RESOLUTION, FINAL_PLOT_RESOLUTION, -1)
+        final_frame = final_frame.rot90().cpu().numpy()
+        plot_path = Path(spec["plot_path"])
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_plot = plot_path.with_suffix(".tmp.png")
+        make_static_plot(final_frame, variables, temporary_plot)
+        temporary_plot.replace(plot_path)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         result.update(training)
+        result["plot_file"] = str(plot_path)
         result["status"] = "ok"
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -1314,6 +1336,7 @@ def execute_worker(case, config, input_file, output_dir, device_name, max_vram_g
     token = f"{case['id']}-{config_fingerprint(config, input_file)}"
     spec_path = worker_dir / f"{token}.spec.json"
     result_path = worker_dir / f"{token}.result.json"
+    plot_path = output_dir / "plots" / f"{case['id']}.png"
 
     def cleanup_worker_files():
         for path in (spec_path, result_path):
@@ -1332,12 +1355,15 @@ def execute_worker(case, config, input_file, output_dir, device_name, max_vram_g
         "config": config,
         "absolute_deadline": started + float(config["max_seconds"]),
         "result_path": str(result_path.resolve()),
+        "plot_path": str(plot_path.resolve()),
     }
     with open(spec_path, "w", encoding="utf-8") as handle:
         json.dump(spec, handle)
         handle.write("\n")
     if result_path.exists():
         result_path.unlink()
+    if plot_path.exists():
+        plot_path.unlink()
     command = [
         sys.executable,
         str(Path(__file__).resolve()),

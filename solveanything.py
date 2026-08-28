@@ -1644,6 +1644,43 @@ def _plot_limits(minimum, maximum):
     return minimum, maximum
 
 
+def make_static_plot(frame, variables, output_file):
+    """Save one final approximation frame with the GIF's field layout."""
+    frame = np.asarray(frame)
+    if frame.ndim != 3 or frame.shape[-1] != len(variables):
+        raise ValueError(
+            f"Frame has shape {frame.shape}, expected (height, width, "
+            f"{len(variables)})"
+        )
+
+    column_count = len(variables)
+    fig, axes = plt.subplots(
+        1,
+        column_count,
+        squeeze=False,
+        figsize=(4.8 * column_count, 4.0),
+    )
+    for field_index, variable in enumerate(variables):
+        field = frame[:, :, field_index]
+        field_limits = _plot_limits(field.min(), field.max())
+        axis = axes[0, field_index]
+        image_artist = axis.imshow(
+            field,
+            extent=(0, 1, 0, 1),
+            vmin=field_limits[0],
+            vmax=field_limits[1],
+        )
+        fig.colorbar(image_artist, ax=axis)
+        axis.set_title(f"Approximation: {variable}")
+        axis.set_xlabel("x")
+        axis.set_ylabel("y")
+        axis.margins(0)
+
+    fig.tight_layout()
+    fig.savefig(str(output_file), dpi=150)
+    plt.close(fig)
+
+
 def make_gif(frames, variables, output_file, solution=None):
     """Animate approximations and optionally show analytic solutions below them."""
     if not frames:
