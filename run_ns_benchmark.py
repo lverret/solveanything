@@ -16,6 +16,7 @@ import math
 import os
 import random
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.animation import FFMpegWriter
+from matplotlib.animation import FFMpegWriter, PillowWriter
 
 from solveanything import (
     CollocationSampler,
@@ -49,6 +50,31 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "benchmark_results" / "navier_stokes"
 MAX_SECONDS_ALLOWED = 200.0
 MAX_VRAM_GB_ALLOWED = 8.0
 RESULT_SCHEMA_VERSION = 2
+
+
+def find_ffmpeg_executable():
+    """Return an available FFmpeg binary without requiring a system install."""
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        return None
+    try:
+        executable = imageio_ffmpeg.get_ffmpeg_exe()
+    except (OSError, RuntimeError):
+        return None
+    if executable and Path(executable).is_file() and os.access(executable, os.X_OK):
+        return executable
+    return None
+
+
+def artifact_suffix(problem):
+    """Choose a portable final-artifact format for a physical problem."""
+    if "t" not in problem["bounds"]:
+        return ".png"
+    return ".mp4" if find_ffmpeg_executable() else ".gif"
 
 
 # Ghia, Ghia & Shin (1982), Tables I and II.  The Re=400 value at x=0.9063
@@ -896,7 +922,19 @@ def save_video(model, problem, variables, device, config, output_file):
         axis.set_ylabel("y")
         images.append(image)
     fig.tight_layout()
-    writer = FFMpegWriter(fps=int(config["video_fps"]), codec="h264")
+    if output_file.suffix.lower() == ".mp4":
+        executable = find_ffmpeg_executable()
+        if executable is None:
+            raise RuntimeError(
+                "MP4 output requires FFmpeg; use a .gif output path when it is "
+                "unavailable"
+            )
+        matplotlib.rcParams["animation.ffmpeg_path"] = executable
+        writer = FFMpegWriter(fps=int(config["video_fps"]), codec="h264")
+    elif output_file.suffix.lower() == ".gif":
+        writer = PillowWriter(fps=int(config["video_fps"]))
+    else:
+        raise ValueError("Temporal artifacts must use an .mp4 or .gif suffix")
     with writer.saving(fig, str(output_file), dpi=120):
         for time_value, frame in zip(times, frames):
             for index, image in enumerate(images):
@@ -1082,7 +1120,7 @@ def execute_worker(
     token = f"{identifier}-{fingerprint(problem, approach, config)}"
     spec_path = worker_dir / f"{token}.spec.json"
     result_path = worker_dir / f"{token}.result.json"
-    suffix = ".mp4" if "t" in problem["bounds"] else ".png"
+    suffix = artifact_suffix(problem)
     artifact_path = output_dir / "artifacts" / problem["id"] / f"{approach['id']}{suffix}"
 
     def cleanup():
@@ -1358,6 +1396,12 @@ def run(args):
             config.update(overrides)
             validate_config(config)
             runs.append((problem, approach, config))
+    if any("t" in problem["bounds"] for problem, _, _ in runs):
+        if find_ffmpeg_executable() is None:
+            print(
+                "FFmpeg was not found; temporal artifacts will be written as "
+                "animated GIFs. Install imageio-ffmpeg to enable H.264 MP4 output."
+            )
     if args.dry_run:
         print_catalog(problems, approaches)
         print(f"\n{len(runs)} compatible runs")

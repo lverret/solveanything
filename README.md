@@ -15,7 +15,7 @@ PINN-like approaches on classical incompressible Navier--Stokes problems.
 - NumPy
 - Matplotlib
 - Pillow and tqdm
-- FFmpeg for temporal `.mp4` artifacts
+- optional FFmpeg or `imageio-ffmpeg` for H.264 `.mp4` artifacts
 
 ## Problem files
 
@@ -122,7 +122,9 @@ seconds and 8 GiB of allocated CUDA memory. Results are atomically persisted to
 successful runs can be resumed. Final trained models produce:
 
 - one `.png` field plot for `(x, y)` problems;
-- one H.264 `.mp4` over physical time for `(x, y, t)` problems.
+- one animation over physical time for `(x, y, t)` problems. The runner writes
+  H.264 `.mp4` when a system FFmpeg or the optional `imageio-ffmpeg` package is
+  available, and otherwise falls back automatically to an animated `.gif`.
 
 Artifacts are stored under
 `benchmark_results/navier_stokes/artifacts/<problem>/<approach>.*`.
