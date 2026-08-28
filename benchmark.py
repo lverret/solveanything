@@ -37,6 +37,11 @@ def benchmark_problem(path, resolution, seed, device):
         equations,
         variables,
         domains,
+        # Keep the folder sweep a short regression benchmark instead of using
+        # the 180-second cavity-oriented CLI budget for every analytic example.
+        nb_iter=500,
+        nb_samples=1000,
+        max_seconds=None,
         device=device,
         progress=False,
     )

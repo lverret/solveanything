@@ -44,17 +44,21 @@ higher-order expressions automatically fall back to PyTorch autograd.
 python solveanything.py --input_file examples/01_direct_bilinear.txt
 ```
 
-By default, this writes `out.gif`. If the file provides a `# Solution`, the GIF
-shows the evolving approximation in its first row and the analytic solution in
-its second row, using the same color scale for each output field.
+By default, this selects CUDA when available and trains the low-frequency SIREN
+configuration selected by the Re=100 cavity benchmark: frequencies `(3, 3)`,
+four hidden layers of width 256, grouped IID collocation sets of size 2048, MSE
+residuals, boundary-to-PDE loss ramping, and Adam with a `3e-4` to `1e-5`
+cosine schedule. Training has a 180-second wall-clock budget and a 50,000-step
+cap. This writes `out.gif`. If the file provides a `# Solution`, the GIF shows
+the evolving approximation in its first row and the analytic solution in its
+second row, using the same color scale for each output field.
 
 Use `--no_gif` to train without collecting or exporting animation frames. Run
 `python solveanything.py --help` for all model and training options.
 
 ## Benchmark a folder
 
-Run all problem files in `examples` with the solver's default SIREN and training
-parameters:
+Run all problem files in `examples` with a short 500-step regression profile:
 
 ```bash
 python benchmark.py examples
