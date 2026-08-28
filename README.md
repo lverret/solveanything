@@ -1,147 +1,148 @@
 # solveanything
 
-`solveanything` takes a set of equations and trains a 2D function that best
-satisfies them. Like a physics-informed neural network, it can solve direct
-function definitions, boundary-value problems, differential equations, and
-coupled systems. The approximating model is a
-[SIREN](https://arxiv.org/abs/2006.09661), and mathematical expressions are
-validated by a small AST parser before training.
+`solveanything.py` is a small library for parsing equations and training
+coordinate neural networks against their residuals. It supports two-dimensional
+steady fields `(x, y)` and two-space/one-time fields `(x, y, t)`, arbitrary
+coordinate bounds, and named geometric sampling domains.
+
+The executable entry point is `run_ns_benchmark.py`, a resumable benchmark of
+PINN-like approaches on classical incompressible Navier--Stokes problems.
 
 ## Requirements
 
-- [PyTorch](https://pytorch.org/)
-- [Matplotlib](https://matplotlib.org/)
-- [Pillow](https://python-pillow.org/)
-- [tqdm](https://tqdm.github.io/)
+- Python 3.10+
+- PyTorch
+- NumPy
+- Matplotlib
+- Pillow and tqdm
+- optional FFmpeg or `imageio-ffmpeg` for H.264 `.mp4` artifacts
 
-## Problem-file format
+## Problem files
 
-Problem files contain an `# Equations` section and may contain a `# Solution`
-section with one analytic formula per output field:
+A problem contains an optional `# Domains` section, a required `# Equations`
+section, and an optional analytic `# Solution` section:
 
 ```text
+# Domains
+space_time = box(x=(0, 2 * pi), y=(0, 2 * pi), t=(0, 1))
+initial = box(x=(0, 2 * pi), y=(0, 2 * pi), t=0)
+
 # Equations
-f = x * y
+u = sin(x) * cos(y) @ initial
+grad(u, t) + u * grad(u, x) + v * grad(u, y) = 0 @ space_time
 
 # Solution
-f = x * y
+u = sin(x) * cos(y) * exp(-0.02 * t)
 ```
 
-The solution section supports `x`, `y`, `pi`, numeric operators, and the
-functions `sqrt`, `sin`, `cos`, `exp`, `abs`, and `tanh`. It is used only for
-visual comparison and benchmarking; it never participates in training.
+The suffix `@ domain_name` selects the points used for that equation. Without
+an annotation, the original unit-square domain inference remains available.
 
-The 37 files in [`examples`](examples) cover direct functions, gradients,
-ODEs, PDEs, nonlinear equations, coupled fields, and higher-frequency cases.
+The safe geometry language supports:
 
-For SIREN models, pure derivatives in `x` or `y` through fourth order are
-propagated exactly through the network layers in one batched pass. Mixed or
-higher-order expressions automatically fall back to PyTorch autograd.
+- `box(x=(xmin, xmax), y=(ymin, ymax), t=(tmin, tmax))`, where any coordinate
+  may instead be fixed to one scalar;
+- `circle(center=(cx, cy), radius=r, t=(tmin, tmax))` for a boundary;
+- `disk(center=(cx, cy), radius=r, ...)` for an interior;
+- `difference(outer, hole, ...)` for perforated fluid domains;
+- `union(first, second, ...)` for grouped boundaries.
 
-## Solve a problem
-
-```bash
-python solveanything.py --input_file examples/01_direct_bilinear.txt
-```
-
-By default, this selects CUDA when available and trains the low-frequency SIREN
-configuration selected by the Re=100 cavity benchmark: frequencies `(3, 3)`,
-four hidden layers of width 256, grouped IID collocation sets of size 2048, MSE
-residuals, boundary-to-PDE loss ramping, and Adam with a `3e-4` to `1e-5`
-cosine schedule. Training has a 180-second wall-clock budget and a 50,000-step
-cap. This writes `out.gif`. If the file provides a `# Solution`, the GIF shows
-the evolving approximation in its first row and the analytic solution in its
-second row, using the same color scale for each output field.
-
-Use `--no_gif` to train without collecting or exporting animation frames. Run
-`python solveanything.py --help` for all model and training options.
-
-## Benchmark a folder
-
-Run all problem files in `examples` with a short 500-step regression profile:
-
-```bash
-python benchmark.py examples
-```
-
-The script resets the Torch seed before each problem, evaluates predictions on
-an 81 by 81 grid, and prints one absolute MSE (averaged across the grid and all
-output fields) per file in an ASCII table. Problems without a `# Solution`
-section are marked `SKIP`; problems that fail are reported as `ERROR` without
-preventing the remaining files from running.
-
-To benchmark one file while developing:
-
-```bash
-python benchmark.py examples --pattern "01_direct_bilinear.txt"
-```
-
-## Re=100 lid-driven-cavity benchmark
-
-`run_lid_driven_cavity_re100_benchmark.py` contains a focused 23-case follow-up
-to the original PINN/INR design of experiments for
-[`examples/37_lid_driven_cavity_re100.txt`](examples/37_lid_driven_cavity_re100.txt).
-Run the complete manifest on CUDA with:
-
-```bash
-python3 run_lid_driven_cavity_re100_benchmark.py --device cuda
-```
-
-Every case runs in an isolated process with a hard wall-clock limit of at most
-200 seconds and a PyTorch allocator cap of at most 8 GiB. Results are written
-after every case to resumable `results.json` and `results.csv` files under
-`benchmark_results/lid_driven_cavity_re100_followup`. Matching successful cases
-are skipped on a later invocation unless `--no-resume` is supplied.
-Each successful case also saves its final `u`, `v`, and `p` fields as
-`plots/<case-id>.png`, using the same orientation, labels, and field layout as
-the solver GIF.
-
-The active follow-up is organized around the first-round evidence:
-
-- **F (10):** controlled autodiff/finite-difference and SIREN/Fourier
-  comparisons, matched 6000-step caps, grid resolution, fourth-order stencils,
-  conservative momentum, and compatible hard constraints.
-- **G (6):** refinement of the successful low-frequency SIREN regime across
-  frequency, width, and depth.
-- **H (7):** boundary/interior sample allocation, loss-ramp ablation, fixed
-  Sobol points, and integral continuity with the low-frequency SIREN.
-
-The original 41 cases remain in `round1_manifest()`, but are not active. Two
-commented lines beside the manifest selection show how to re-enable that round
-with its original defaults.
-
-The sole ranking metric is
+For example, the DFG cylinder interior and no-slip surface are expressed as:
 
 ```text
-E_Ghia = 0.5 * (relative_L2(u(0.5, y)) + relative_L2(v(x, 0.5)))
+# Domains
+fluid = difference(box(x=(0, 2.2), y=(0, 0.41), t=(0, 8)), disk(center=(0.2, 0.2), radius=0.05))
+cylinder = circle(center=(0.2, 0.2), radius=0.05, t=(0, 8))
+
+# Equations
+u = 0 @ cylinder
+v = 0 @ cylinder
 ```
 
-using the Re=100 centerline data from
-[Ghia, Ghia & Shin (1982)](https://doi.org/10.1016/0021-9991(82)90058-4).
-Lower is better. The reference values are used only after training, never in a
-loss or stopping rule.
+See [`benchmarks/navier_stokes`](benchmarks/navier_stokes) for complete files.
 
-Inspect or select built-in cases and override common settings from the command
-line:
+## Navier--Stokes benchmark
+
+List the built-in physical problems and approaches:
 
 ```bash
-python3 run_lid_driven_cavity_re100_benchmark.py --list
-python3 run_lid_driven_cavity_re100_benchmark.py --device cuda --stage F
-python3 run_lid_driven_cavity_re100_benchmark.py --device cuda \
-  --case F01,F02,F03,F04
-python3 run_lid_driven_cavity_re100_benchmark.py --device cuda \
-  --case G02 --set hidden_features=192
+python3 run_ns_benchmark.py --list
 ```
 
-For a JSON-controlled run, export the complete built-in manifest, edit any
-defaults or case-specific `config` objects, and pass it back to the runner:
+Run everything on CUDA:
 
 ```bash
-python3 run_lid_driven_cavity_re100_benchmark.py \
-  --write-config cavity_benchmark.json
-python3 run_lid_driven_cavity_re100_benchmark.py \
-  --config cavity_benchmark.json --device cuda
+python3 run_ns_benchmark.py --device cuda
 ```
 
-Use `--dry-run`, `--help`, and `--list` to validate a selection without opening
-a CUDA context.
+Select individual problems and approaches:
+
+```bash
+python3 run_ns_benchmark.py --device cuda \
+  --problem cavity_re100,cylinder_re100,taylor_green_re100 \
+  --approach siren_low,fourier_mlp
+```
+
+Useful development and configuration commands include:
+
+```bash
+python3 run_ns_benchmark.py --dry-run
+python3 run_ns_benchmark.py --write-config ns_benchmark.json
+python3 run_ns_benchmark.py --config ns_benchmark.json --device cuda
+python3 run_ns_benchmark.py --problem taylor_green_re100 \
+  --approach siren_low --max-steps 5 --max-seconds 30 --device cpu \
+  --set samples=16 --set boundary_samples=16
+```
+
+The built-in suite contains:
+
+- lid-driven cavity at `Re=100`, `400`, and `1000`, ranked by the mean relative
+  `L2` error of the two Ghia centerlines (`E_Ghia`);
+- the DFG cylinder cases 2D-1 (`Re=20`, steady) and 2D-3 (`Re=100`, transient),
+  ranked by the mean relative error of their standard drag, lift, and pressure
+  difference observables (`E_DFG`);
+- the analytic Taylor--Green vortex at `Re=100` and `1000`, ranked by the mean
+  space-time relative `L2` error of `u` and `v` (`E_TGV`).
+
+References are used only after training:
+
+- [Ghia, Ghia & Shin (1982)](https://doi.org/10.1016/0021-9991(82)90058-4)
+- [DFG cylinder 2D-1](https://www.mathematik.tu-dortmund.de/~featflow/en/benchmarks/cfdbenchmarking/flow/dfg_benchmark1_re20.html)
+- [DFG cylinder 2D-3](https://wwwold.mathematik.tu-dortmund.de/~featflow/en/benchmarks/cfdbenchmarking/flow/dfg_benchmark3_re100.html)
+- [Taylor & Green (1937)](https://doi.org/10.1098/rspa.1937.0036)
+
+The default approaches are low-frequency and compact SIRENs, a tanh MLP, a
+Fourier-feature MLP, a modified gated MLP, and SIREN sampling/loss-balancing
+ablations. The structured finite-difference/Fourier approach is available for
+every built-in problem: it uses masked stencils and exact circle boundary
+samples for cylinders, and periodic space-time stencils for Taylor--Green.
+`fd_resolution` controls the approximate square root of the spatial point
+count while preserving a rectangular domain's aspect ratio. Transient runs
+cycle `fd_time_slices` central stencils through `fd_time_resolution` levels.
+For example, a fourth-order cylinder run can be selected with:
+
+```bash
+python3 run_ns_benchmark.py --device cuda --problem cylinder_re100 \
+  --approach fd_fourier --set fd_order=4
+```
+
+Each run executes in an isolated process with a hard limit of at most 200
+seconds and 8 GiB of allocated CUDA memory. Results are atomically persisted to
+`benchmark_results/navier_stokes/results.json` and `results.csv`, so matching
+successful runs can be resumed. Final trained models produce:
+
+- one `.png` field plot for `(x, y)` problems;
+- one animation over physical time for `(x, y, t)` problems. The runner writes
+  H.264 `.mp4` when a system FFmpeg or the optional `imageio-ffmpeg` package is
+  available, and otherwise falls back automatically to an animated `.gif`.
+
+Artifacts are stored under
+`benchmark_results/navier_stokes/artifacts/<problem>/<approach>.*`.
+
+## Library API
+
+`solveanything.py` deliberately has no CLI. Its reusable entry points include
+`parse_problem_file`, `build_model`, `compile_residuals`,
+`compute_equation_losses`, `CollocationSampler`, `train_model`, and
+`make_static_plot`. The files under [`examples`](examples) remain compact parser
+and equation fixtures for direct functions, ODEs, and PDEs.

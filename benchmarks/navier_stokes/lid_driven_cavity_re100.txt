@@ -1,0 +1,21 @@
+# Domains
+left = box(x=0, y=(0, 1))
+right = box(x=1, y=(0, 1))
+bottom = box(x=(0, 1), y=0)
+lid = box(x=(0, 1), y=1)
+gauge = box(x=0, y=0)
+fluid = box(x=(0, 1), y=(0, 1))
+
+# Equations
+u = 0 @ left
+u = 0 @ right
+u = 0 @ bottom
+u = 1 @ lid
+v = 0 @ left
+v = 0 @ right
+v = 0 @ bottom
+v = 0 @ lid
+p = 0 @ gauge
+u * grad(u, x) + v * grad(u, y) + grad(p, x) - 0.01 * (grad(grad(u, x), x) + grad(grad(u, y), y)) = 0 @ fluid
+u * grad(v, x) + v * grad(v, y) + grad(p, y) - 0.01 * (grad(grad(v, x), x) + grad(grad(v, y), y)) = 0 @ fluid
+grad(u, x) + grad(v, y) = 0 @ fluid

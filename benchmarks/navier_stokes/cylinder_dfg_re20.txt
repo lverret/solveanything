@@ -1,0 +1,21 @@
+# Domains
+fluid = difference(box(x=(0, 2.2), y=(0, 0.41)), disk(center=(0.2, 0.2), radius=0.05))
+bottom = box(x=(0, 2.2), y=0)
+top = box(x=(0, 2.2), y=0.41)
+walls = union(bottom, top)
+inlet = box(x=0, y=(0, 0.41))
+outlet = box(x=2.2, y=(0, 0.41))
+cylinder = circle(center=(0.2, 0.2), radius=0.05)
+
+# Equations
+u = 4 * 0.3 * y * (0.41 - y) / (0.41 ** 2) @ inlet
+v = 0 @ inlet
+u = 0 @ walls
+v = 0 @ walls
+u = 0 @ cylinder
+v = 0 @ cylinder
+0.001 * grad(u, x) - p = 0 @ outlet
+grad(v, x) = 0 @ outlet
+u * grad(u, x) + v * grad(u, y) + grad(p, x) - 0.001 * (grad(grad(u, x), x) + grad(grad(u, y), y)) = 0 @ fluid
+u * grad(v, x) + v * grad(v, y) + grad(p, y) - 0.001 * (grad(grad(v, x), x) + grad(grad(v, y), y)) = 0 @ fluid
+grad(u, x) + grad(v, y) = 0 @ fluid
