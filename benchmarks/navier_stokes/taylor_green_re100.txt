@@ -1,0 +1,24 @@
+# Domains
+space_time = box(x=(0, 2 * pi), y=(0, 2 * pi), t=(0, 1))
+initial = box(x=(0, 2 * pi), y=(0, 2 * pi), t=0)
+x_periodic = box(x=0, y=(0, 2 * pi), t=(0, 1))
+y_periodic = box(x=(0, 2 * pi), y=0, t=(0, 1))
+
+# Equations
+u = sin(x) * cos(y) @ initial
+v = -cos(x) * sin(y) @ initial
+p = 0.25 * (cos(2 * x) + cos(2 * y)) @ initial
+u(0, y, t) = u(2 * pi, y, t) @ x_periodic
+v(0, y, t) = v(2 * pi, y, t) @ x_periodic
+p(0, y, t) = p(2 * pi, y, t) @ x_periodic
+u(x, 0, t) = u(x, 2 * pi, t) @ y_periodic
+v(x, 0, t) = v(x, 2 * pi, t) @ y_periodic
+p(x, 0, t) = p(x, 2 * pi, t) @ y_periodic
+grad(u, t) + u * grad(u, x) + v * grad(u, y) + grad(p, x) - 0.01 * (grad(grad(u, x), x) + grad(grad(u, y), y)) = 0 @ space_time
+grad(v, t) + u * grad(v, x) + v * grad(v, y) + grad(p, y) - 0.01 * (grad(grad(v, x), x) + grad(grad(v, y), y)) = 0 @ space_time
+grad(u, x) + grad(v, y) = 0 @ space_time
+
+# Solution
+u = sin(x) * cos(y) * exp(-0.02 * t)
+v = -cos(x) * sin(y) * exp(-0.02 * t)
+p = 0.25 * (cos(2 * x) + cos(2 * y)) * exp(-0.04 * t)
