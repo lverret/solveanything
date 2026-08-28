@@ -1,6 +1,9 @@
 import argparse
 import ast
+import math
+import random
 import re
+import time
 import numpy as np
 import torch
 import operator
@@ -230,6 +233,264 @@ class Siren(torch.nn.Module):
             }
         )
         return outputs
+
+
+def _activation(name):
+    """Return an activation module used by the configurable model factory."""
+    activations = {
+        "tanh": torch.nn.Tanh,
+        "gelu": torch.nn.GELU,
+        "silu": torch.nn.SiLU,
+    }
+    try:
+        return activations[name.lower()]()
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown activation {name!r}; choose from {sorted(activations)}"
+        ) from error
+
+
+class WeightFactorizedLinear(torch.nn.Module):
+    """Linear layer with trainable row scale and direction parameters."""
+
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        initial = torch.empty(out_features, in_features)
+        torch.nn.init.kaiming_uniform_(initial, a=np.sqrt(5))
+        norms = initial.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        self.direction = torch.nn.Parameter(initial / norms)
+        self.log_scale = torch.nn.Parameter(norms.log())
+        if bias:
+            bound = 1 / np.sqrt(in_features)
+            self.bias = torch.nn.Parameter(
+                torch.empty(out_features).uniform_(-bound, bound)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, value):
+        weight = self.direction * self.log_scale.exp()
+        return F.linear(value, weight, self.bias)
+
+
+class MLP(torch.nn.Module):
+    """A coordinate MLP with optional random weight factorization."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+        random_weight_factorization=False,
+    ):
+        super().__init__()
+        linear = (
+            WeightFactorizedLinear if random_weight_factorization else torch.nn.Linear
+        )
+        layers = [linear(in_features, hidden_features), _activation(activation)]
+        for _ in range(max(0, hidden_layers - 1)):
+            layers.extend(
+                [linear(hidden_features, hidden_features), _activation(activation)]
+            )
+        layers.append(linear(hidden_features, out_features))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x, y):
+        return self.net(torch.cat([x, y], dim=-1))
+
+
+class FourierFeatureMLP(torch.nn.Module):
+    """Tanh MLP preceded by a frozen Gaussian Fourier feature map."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        fourier_features=64,
+        fourier_sigma=2.0,
+        activation="tanh",
+    ):
+        super().__init__()
+        self.register_buffer(
+            "projection",
+            torch.randn(in_features, fourier_features) * float(fourier_sigma),
+        )
+        self.mlp = MLP(
+            2 * fourier_features,
+            hidden_features,
+            hidden_layers,
+            out_features,
+            activation=activation,
+        )
+
+    def forward(self, x, y):
+        coordinates = torch.cat([x, y], dim=-1)
+        phase = 2 * np.pi * coordinates @ self.projection
+        features = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
+        midpoint = features.size(-1) // 2
+        return self.mlp(features[:, :midpoint], features[:, midpoint:])
+
+
+class ModifiedMLP(torch.nn.Module):
+    """Gated MLP used in the PINN gradient-pathology literature."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+    ):
+        super().__init__()
+        self.activation = _activation(activation)
+        self.encoder_u = torch.nn.Linear(in_features, hidden_features)
+        self.encoder_v = torch.nn.Linear(in_features, hidden_features)
+        self.input_layer = torch.nn.Linear(in_features, hidden_features)
+        self.hidden = torch.nn.ModuleList(
+            torch.nn.Linear(hidden_features, hidden_features)
+            for _ in range(max(0, hidden_layers - 1))
+        )
+        self.output_layer = torch.nn.Linear(hidden_features, out_features)
+
+    def forward(self, x, y):
+        coordinates = torch.cat([x, y], dim=-1)
+        encoder_u = self.activation(self.encoder_u(coordinates))
+        encoder_v = self.activation(self.encoder_v(coordinates))
+        hidden = self.activation(self.input_layer(coordinates))
+        for layer in self.hidden:
+            gate = self.activation(layer(hidden))
+            hidden = (1 - gate) * encoder_u + gate * encoder_v
+        return self.output_layer(hidden)
+
+
+class PirateNet(torch.nn.Module):
+    """Compact physics-informed residual network with zero-initialized blocks."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+    ):
+        super().__init__()
+        self.activation = _activation(activation)
+        self.input_layer = torch.nn.Linear(in_features, hidden_features)
+        self.blocks = torch.nn.ModuleList()
+        self.residual_scales = torch.nn.ParameterList()
+        for _ in range(hidden_layers):
+            self.blocks.append(
+                torch.nn.Sequential(
+                    torch.nn.Linear(hidden_features, hidden_features),
+                    _activation(activation),
+                    torch.nn.Linear(hidden_features, hidden_features),
+                    _activation(activation),
+                )
+            )
+            self.residual_scales.append(torch.nn.Parameter(torch.zeros(())))
+        self.output_layer = torch.nn.Linear(hidden_features, out_features)
+
+    def forward(self, x, y):
+        hidden = self.activation(self.input_layer(torch.cat([x, y], dim=-1)))
+        for block, scale in zip(self.blocks, self.residual_scales):
+            hidden = hidden + scale * block(hidden)
+        return self.output_layer(hidden)
+
+
+class MultiHeadMLP(torch.nn.Module):
+    """Coordinate MLP with a shared trunk and one scalar head per field."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        hidden_layers,
+        out_features,
+        activation="tanh",
+    ):
+        super().__init__()
+        layers = [
+            torch.nn.Linear(in_features, hidden_features),
+            _activation(activation),
+        ]
+        for _ in range(max(0, hidden_layers - 1)):
+            layers.extend(
+                [
+                    torch.nn.Linear(hidden_features, hidden_features),
+                    _activation(activation),
+                ]
+            )
+        self.trunk = torch.nn.Sequential(*layers)
+        self.heads = torch.nn.ModuleList(
+            torch.nn.Linear(hidden_features, 1) for _ in range(out_features)
+        )
+
+    def forward(self, x, y):
+        hidden = self.trunk(torch.cat([x, y], dim=-1))
+        return torch.cat([head(hidden) for head in self.heads], dim=-1)
+
+
+def build_model(
+    architecture,
+    in_features,
+    hidden_features,
+    hidden_layers,
+    out_features,
+    first_omega_0=10.0,
+    hidden_omega_0=30.0,
+    activation="tanh",
+    fourier_features=64,
+    fourier_sigma=2.0,
+):
+    """Build one of the coordinate-network backbones used by experiments."""
+    architecture = architecture.lower()
+    common = dict(
+        in_features=in_features,
+        hidden_features=hidden_features,
+        hidden_layers=hidden_layers,
+        out_features=out_features,
+    )
+    if architecture == "siren":
+        model = Siren(
+            **common,
+            first_omega_0=first_omega_0,
+            hidden_omega_0=hidden_omega_0,
+        )
+    elif architecture == "mlp":
+        model = MLP(**common, activation=activation)
+    elif architecture == "rwf_mlp":
+        model = MLP(
+            **common,
+            activation=activation,
+            random_weight_factorization=True,
+        )
+    elif architecture == "fourier_mlp":
+        model = FourierFeatureMLP(
+            **common,
+            activation=activation,
+            fourier_features=fourier_features,
+            fourier_sigma=fourier_sigma,
+        )
+    elif architecture == "modified_mlp":
+        model = ModifiedMLP(**common, activation=activation)
+    elif architecture == "piratenet":
+        model = PirateNet(**common, activation=activation)
+    elif architecture == "multihead_mlp":
+        model = MultiHeadMLP(**common, activation=activation)
+    else:
+        raise ValueError(
+            "Unknown architecture {!r}; choose siren, mlp, rwf_mlp, "
+            "fourier_mlp, modified_mlp, piratenet, or multihead_mlp".format(
+                architecture
+            )
+        )
+    return model
 
 
 # -----------------------------------------------------------------------------
@@ -890,7 +1151,94 @@ def evaluate_solution_functions(solution_functions, variables, x, y):
 # Training and visualization functions
 
 
-def generate_samples(domain, nb_samples, device, requires_grad=True):
+def _domain_key(domain):
+    return tuple(
+        None if np.isnan(domain[coordinate]) else float(domain[coordinate])
+        for coordinate in ("x", "y")
+    )
+
+
+class CollocationSampler:
+    """Reusable IID, scrambled Sobol, fixed Sobol, or wall-mixture sampler."""
+
+    def __init__(self, method="iid", seed=0, wall_fraction=0.5, wall_width=0.1):
+        if method not in {"iid", "sobol", "fixed_sobol", "wall_mixture"}:
+            raise ValueError(f"Unknown sampling method {method!r}")
+        self.method = method
+        self.seed = int(seed)
+        self.wall_fraction = float(wall_fraction)
+        self.wall_width = float(wall_width)
+        self._engines = {}
+        self._fixed_samples = {}
+
+    def _unit_samples(self, domain, nb_samples):
+        key = _domain_key(domain)
+        free_coordinates = sum(value is None for value in key)
+        if not free_coordinates:
+            return torch.empty(nb_samples, 0)
+        if self.method == "iid":
+            engine_key = ("iid", key)
+            generator = self._engines.setdefault(
+                engine_key,
+                torch.Generator().manual_seed(self.seed + len(self._engines)),
+            )
+            return torch.rand(nb_samples, free_coordinates, generator=generator)
+        engine_key = ("sobol", key)
+        engine = self._engines.setdefault(
+            engine_key,
+            torch.quasirandom.SobolEngine(
+                free_coordinates,
+                scramble=True,
+                seed=self.seed + len(self._engines),
+            ),
+        )
+        return engine.draw(nb_samples)
+
+    def sample(self, domain, nb_samples, device, requires_grad=True):
+        key = (_domain_key(domain), int(nb_samples))
+        if self.method == "fixed_sobol" and key in self._fixed_samples:
+            unit = self._fixed_samples[key].clone()
+        else:
+            unit = self._unit_samples(domain, nb_samples)
+            if self.method == "fixed_sobol":
+                self._fixed_samples[key] = unit.clone()
+
+        if self.method == "wall_mixture" and all(
+            np.isnan(domain[coordinate]) for coordinate in ("x", "y")
+        ):
+            wall_count = min(nb_samples, round(nb_samples * self.wall_fraction))
+            if wall_count:
+                generator_key = ("wall", _domain_key(domain))
+                generator = self._engines.setdefault(
+                    generator_key, torch.Generator().manual_seed(self.seed + 7919)
+                )
+                axis = torch.randint(0, 2, (wall_count,), generator=generator)
+                side = torch.randint(0, 2, (wall_count,), generator=generator)
+                distance = (
+                    torch.rand(wall_count, generator=generator).square()
+                    * self.wall_width
+                )
+                rows = torch.arange(wall_count)
+                unit[rows, axis] = torch.where(side.bool(), 1 - distance, distance)
+
+        unit = unit.to(device=device)
+        samples = {}
+        free_index = 0
+        for coordinate in ("x", "y"):
+            if np.isnan(domain[coordinate]):
+                value = unit[:, free_index : free_index + 1]
+                free_index += 1
+            else:
+                value = torch.full(
+                    (nb_samples, 1), float(domain[coordinate]), device=device
+                )
+            samples[coordinate] = value.detach().requires_grad_(requires_grad)
+        return samples
+
+
+def generate_samples(domain, nb_samples, device, requires_grad=True, sampler=None):
+    if sampler is not None:
+        return sampler.sample(domain, nb_samples, device, requires_grad)
     samples = {"x": None, "y": None}
     for inp in ["x", "y"]:
         if np.isnan(domain[inp]):
@@ -923,7 +1271,8 @@ def _requires_autograd_derivatives(node, field_indices, analytic_derivatives):
     )
 
 
-def _compile_residuals(equations, field_indices, model):
+def compile_residuals(equations, field_indices, model):
+    """Parse equations once and annotate their derivative requirements."""
     analytic_derivatives = hasattr(model, "forward_with_derivatives")
     residuals = []
     for formula in equations:
@@ -939,6 +1288,140 @@ def _compile_residuals(equations, field_indices, model):
             )
         )
     return residuals
+
+
+def _compile_residuals(equations, field_indices, model):
+    """Backward-compatible alias for :func:`compile_residuals`."""
+    return compile_residuals(equations, field_indices, model)
+
+
+def _merged_derivative_requests(residuals):
+    requests = {}
+    for _, derivative_requests, _ in residuals:
+        for coordinate_signature, orders in derivative_requests.items():
+            requests.setdefault(coordinate_signature, set()).update(orders)
+    return {
+        coordinate_signature: tuple(sorted(orders))
+        for coordinate_signature, orders in requests.items()
+    }
+
+
+def evaluate_residuals(
+    residuals,
+    domains,
+    model,
+    field_indices,
+    nb_samples,
+    device,
+    sampler=None,
+    grouped=True,
+):
+    """Evaluate equation residuals, optionally sharing samples/model passes.
+
+    The returned list contains ``(residual_tensor, samples)`` pairs in equation
+    order. Equations on the same geometric domain share both a collocation set
+    and an evaluation cache when ``grouped`` is true.
+    """
+    if len(residuals) != len(domains):
+        raise ValueError("Residual and domain counts do not match")
+    if isinstance(nb_samples, int):
+        sample_counts = [nb_samples] * len(residuals)
+    else:
+        sample_counts = list(nb_samples)
+        if len(sample_counts) != len(residuals):
+            raise ValueError("Sample-count and residual counts do not match")
+    if grouped:
+        grouped_indices = {}
+        for index, domain in enumerate(domains):
+            grouped_indices.setdefault(_domain_key(domain), []).append(index)
+        groups = list(grouped_indices.values())
+    else:
+        groups = [[index] for index in range(len(residuals))]
+
+    evaluations = [None] * len(residuals)
+    for indices in groups:
+        group_residuals = [residuals[index] for index in indices]
+        group_counts = {int(sample_counts[index]) for index in indices}
+        if len(group_counts) != 1:
+            raise ValueError(
+                "Equations grouped on one domain must use the same sample count"
+            )
+        group_sample_count = group_counts.pop()
+        requires_grad = any(item[2] for item in group_residuals)
+        samples = generate_samples(
+            domains[indices[0]],
+            group_sample_count,
+            device,
+            requires_grad=requires_grad,
+            sampler=sampler,
+        )
+        evaluation_cache = {
+            "model_outputs": {},
+            "derivative_outputs": {},
+            "derivative_requests": _merged_derivative_requests(group_residuals),
+        }
+        coordinate_cache = {}
+        for index in indices:
+            node = residuals[index][0]
+            value = evaluate(
+                node,
+                samples,
+                model,
+                field_indices,
+                coordinate_cache=coordinate_cache,
+                evaluation_cache=evaluation_cache,
+            )
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, dtype=torch.float32, device=device)
+                value = value.expand(group_sample_count, 1)
+            evaluations[index] = (value, samples)
+    return evaluations
+
+
+def reduce_residual(residual, penalty="mae", huber_delta=0.01, weights=None):
+    """Reduce a pointwise residual using a PINN training penalty."""
+    if penalty == "mae":
+        values = residual.abs()
+    elif penalty == "mse":
+        values = residual.square()
+    elif penalty in {"huber", "pseudo_huber"}:
+        delta = float(huber_delta)
+        values = delta**2 * (torch.sqrt(1 + (residual / delta).square()) - 1)
+    else:
+        raise ValueError(f"Unknown residual penalty {penalty!r}")
+    if weights is not None:
+        values = values * weights
+    return values.mean()
+
+
+def compute_equation_losses(
+    residuals,
+    domains,
+    model,
+    field_indices,
+    nb_samples,
+    device,
+    sampler=None,
+    grouped=True,
+    penalty="mae",
+    huber_delta=0.01,
+):
+    """Return one reduced loss and one raw evaluation per equation."""
+    evaluations = evaluate_residuals(
+        residuals,
+        domains,
+        model,
+        field_indices,
+        nb_samples,
+        device,
+        sampler=sampler,
+        grouped=grouped,
+    )
+    losses = [
+        reduce_residual(value, penalty=penalty, huber_delta=huber_delta)
+        for value, _ in evaluations
+    ]
+    return losses, evaluations
 
 
 def compute_loss(
@@ -981,28 +1464,89 @@ def compute_loss(
     return torch.stack(losses).mean()
 
 
+def _is_interior_domain(domain):
+    return np.isnan(domain["x"]) and np.isnan(domain["y"])
+
+
+def _training_progress(iteration, started, nb_iter, max_seconds):
+    step_progress = iteration / max(1, nb_iter)
+    if max_seconds is None:
+        return min(1.0, step_progress)
+    time_progress = (time.monotonic() - started) / max(1e-6, max_seconds)
+    return min(1.0, max(step_progress, time_progress))
+
+
+def _combine_training_losses(equation_losses, domains, loss_balance, progress):
+    boundary_losses = [
+        loss
+        for loss, domain in zip(equation_losses, domains)
+        if not _is_interior_domain(domain)
+    ]
+    interior_losses = [
+        loss
+        for loss, domain in zip(equation_losses, domains)
+        if _is_interior_domain(domain)
+    ]
+
+    # Direct-function examples can contain only full-domain equations. Keep the
+    # grouped loss useful beyond boundary-value PDEs by accepting either group.
+    if not boundary_losses:
+        return torch.stack(interior_losses).mean()
+    if not interior_losses:
+        return torch.stack(boundary_losses).mean()
+
+    boundary = torch.stack(boundary_losses).mean()
+    interior = torch.stack(interior_losses).mean()
+    if loss_balance == "equal_groups":
+        return 0.5 * (boundary + interior)
+    if loss_balance == "boundary_pde_ramp":
+        pde_weight = min(1.0, 0.1 + 3.0 * progress)
+        return (boundary + pde_weight * interior) / (1.0 + pde_weight)
+    if loss_balance == "legacy":
+        weighted = [
+            (0.1 if _is_interior_domain(domain) else 0.9) * loss
+            for loss, domain in zip(equation_losses, domains)
+        ]
+        return torch.stack(weighted).mean()
+    raise ValueError(f"Unknown loss balance {loss_balance!r}")
+
+
 def train_model(
     equations,
     variables,
     domains,
-    nb_iter=500,
-    nb_samples=1000,
-    lr=0.0001,
+    nb_iter=50000,
+    nb_samples=2048,
+    lr=0.0003,
+    min_lr=0.00001,
+    lr_schedule="cosine",
     lr_gamma=0.99,
     hidden_layers=4,
     hidden_features=256,
-    first_omega_0=10.0,
-    hidden_omega_0=30.0,
+    first_omega_0=3.0,
+    hidden_omega_0=3.0,
+    sampling="iid",
+    grouped=True,
+    penalty="mse",
+    loss_balance="boundary_pde_ramp",
+    seed=0,
+    max_seconds=180.0,
     device="cpu",
     progress=True,
     iteration_callback=None,
 ):
-    """Train and return a SIREN that approximates the parsed variables.
+    """Train and return a low-frequency SIREN for the parsed variables.
 
     ``iteration_callback`` receives ``(iteration, model, loss_value)`` after
     each optimizer step. It is used by the CLI for optional frame collection
     without coupling the reusable training loop to GIF generation.
     """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     field_indices = {
         variable: index for index, variable in enumerate(variables)
     }
@@ -1017,24 +1561,54 @@ def train_model(
     residuals = _compile_residuals(equations, field_indices, model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=lr_gamma
-    )
+    if lr_schedule not in {"cosine", "exponential", "constant"}:
+        raise ValueError(f"Unknown learning-rate schedule {lr_schedule!r}")
+    scheduler = None
+    if lr_schedule == "exponential":
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=lr_gamma
+        )
+    sampler = CollocationSampler(method=sampling, seed=seed)
     iterations = (
         trange(nb_iter, desc="Solving equation(s)") if progress else range(nb_iter)
     )
+    started = time.monotonic()
+    deadline = None
+    if max_seconds is not None:
+        if max_seconds <= 4:
+            raise ValueError("max_seconds must be greater than 4 seconds")
+        # Match the cavity benchmark: leave four seconds for validation and
+        # process/GIF bookkeeping inside the advertised runtime budget.
+        deadline = started + max_seconds - 4.0
 
     model.train()
     for iteration in iterations:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        training_progress = _training_progress(
+            iteration, started, nb_iter, max_seconds
+        )
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(
-            equations,
+        sample_counts = [nb_samples] * len(equations)
+        for index, domain in enumerate(domains):
+            if not np.isnan(domain["x"]) and not np.isnan(domain["y"]):
+                sample_counts[index] = 1
+        equation_losses, _ = compute_equation_losses(
+            residuals,
             domains,
             model,
             field_indices,
-            nb_samples,
+            sample_counts,
             device,
-            residuals,
+            sampler=sampler,
+            grouped=grouped,
+            penalty=penalty,
+        )
+        loss = _combine_training_losses(
+            equation_losses,
+            domains,
+            loss_balance=loss_balance,
+            progress=training_progress,
         )
         if not torch.isfinite(loss):
             raise RuntimeError(
@@ -1042,11 +1616,21 @@ def train_model(
             )
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
+        elif lr_schedule == "cosine":
+            current_lr = min_lr + 0.5 * (lr - min_lr) * (
+                1.0 + math.cos(math.pi * training_progress)
+            )
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = current_lr
 
         loss_value = loss.item()
         if progress:
-            iterations.set_postfix(loss=loss_value)
+            iterations.set_postfix(
+                loss=loss_value,
+                lr=optimizer.param_groups[0]["lr"],
+            )
         if iteration_callback is not None:
             iteration_callback(iteration, model, loss_value)
 
@@ -1058,6 +1642,43 @@ def _plot_limits(minimum, maximum):
         padding = max(0.5, abs(minimum) * 0.05)
         return minimum - padding, maximum + padding
     return minimum, maximum
+
+
+def make_static_plot(frame, variables, output_file):
+    """Save one final approximation frame with the GIF's field layout."""
+    frame = np.asarray(frame)
+    if frame.ndim != 3 or frame.shape[-1] != len(variables):
+        raise ValueError(
+            f"Frame has shape {frame.shape}, expected (height, width, "
+            f"{len(variables)})"
+        )
+
+    column_count = len(variables)
+    fig, axes = plt.subplots(
+        1,
+        column_count,
+        squeeze=False,
+        figsize=(4.8 * column_count, 4.0),
+    )
+    for field_index, variable in enumerate(variables):
+        field = frame[:, :, field_index]
+        field_limits = _plot_limits(field.min(), field.max())
+        axis = axes[0, field_index]
+        image_artist = axis.imshow(
+            field,
+            extent=(0, 1, 0, 1),
+            vmin=field_limits[0],
+            vmax=field_limits[1],
+        )
+        fig.colorbar(image_artist, ax=axis)
+        axis.set_title(f"Approximation: {variable}")
+        axis.set_xlabel("x")
+        axis.set_ylabel("y")
+        axis.margins(0)
+
+    fig.tight_layout()
+    fig.savefig(str(output_file), dpi=150)
+    plt.close(fig)
 
 
 def make_gif(frames, variables, output_file, solution=None):
@@ -1164,11 +1785,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_file", "-o", type=str, default="out.gif", help="output gif filename"
     )
-    parser.add_argument("--nb_iter", type=int, default=500, help="number of iterations")
     parser.add_argument(
-        "--nb_samples", type=int, default=1000, help="number of uniform samples"
+        "--nb_iter",
+        type=int,
+        default=50000,
+        help="maximum optimizer steps (default: 50000)",
     )
-    parser.add_argument("--lr", type=float, default=0.0001, help="learning rate")
+    parser.add_argument(
+        "--nb_samples",
+        type=int,
+        default=2048,
+        help="samples per geometric domain (default: 2048)",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=0.0003, help="peak learning rate"
+    )
+    parser.add_argument(
+        "--min_lr", type=float, default=0.00001, help="cosine-decay floor"
+    )
+    parser.add_argument(
+        "--lr_schedule",
+        choices=("cosine", "exponential", "constant"),
+        default="cosine",
+        help="learning-rate schedule (default: cosine)",
+    )
     parser.add_argument(
         "--lr_gamma",
         type=float,
@@ -1182,7 +1822,46 @@ if __name__ == "__main__":
         "--hidden_features", type=int, default=256, help="size of the hidden features"
     )
     parser.add_argument(
-        "--omega_0", type=float, default=10.0, help="first omega_0 of siren"
+        "--omega_0", type=float, default=3.0, help="first SIREN omega_0"
+    )
+    parser.add_argument(
+        "--hidden_omega_0",
+        type=float,
+        default=3.0,
+        help="hidden-layer SIREN omega_0",
+    )
+    parser.add_argument(
+        "--sampling",
+        choices=("iid", "sobol", "fixed_sobol", "wall_mixture"),
+        default="iid",
+        help="collocation sampler (default: iid)",
+    )
+    parser.add_argument(
+        "--grouped",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="share samples and field evaluations by geometric domain",
+    )
+    parser.add_argument(
+        "--penalty",
+        choices=("mse", "mae", "pseudo_huber"),
+        default="mse",
+        help="pointwise residual penalty (default: mse)",
+    )
+    parser.add_argument(
+        "--loss_balance",
+        choices=("boundary_pde_ramp", "equal_groups", "legacy"),
+        default="boundary_pde_ramp",
+        help="boundary/interior loss weighting (default: boundary_pde_ramp)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Python, NumPy, and Torch seed"
+    )
+    parser.add_argument(
+        "--max_seconds",
+        type=float,
+        default=180.0,
+        help="training wall-clock budget (default: 180)",
     )
     parser.add_argument(
         "--resolution", type=int, default=128, help="image resolution for the gif"
@@ -1190,32 +1869,56 @@ if __name__ == "__main__":
     parser.add_argument(
         "--nb_frames", type=int, default=50, help="number of frames for the gif"
     )
-    parser.add_argument("--device", type=str, default="cpu", help="device to use")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device; auto selects CUDA when available (default: auto)",
+    )
     parser.add_argument(
         "--no_gif", action="store_true", help="skip GIF frame collection and export"
     )
     args = parser.parse_args()
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     equations, variables, domains, solution_functions = parse_problem_file(
         args.input_file
     )
     frames = []
     frame_coordinates = None
+    animation_started = time.monotonic()
+    animation_state = {
+        "next_frame_fraction": 0.0,
+        "last_frame_iteration": None,
+    }
     if not args.no_gif:
         frame_coordinates = torch.cartesian_prod(
             torch.linspace(0, 1, args.resolution),
             torch.linspace(0, 1, args.resolution),
         ).to(args.device)
 
+    def append_frame(iteration, model):
+        with torch.no_grad():
+            out = model(
+                frame_coordinates[:, 0:1], frame_coordinates[:, 1:2]
+            )
+        out = out.view(args.resolution, args.resolution, out.size(-1))
+        out = out.rot90().cpu().numpy()
+        frames.append(out)
+        animation_state["last_frame_iteration"] = iteration
+
     def collect_frame(iteration, model, loss_value):
-        if iteration % max(1, (args.nb_iter // args.nb_frames)) == 0:
-            with torch.no_grad():
-                out = model(
-                    frame_coordinates[:, 0:1], frame_coordinates[:, 1:2]
-                )
-            out = out.view(args.resolution, args.resolution, out.size(-1))
-            out = out.rot90().cpu().numpy()
-            frames.append(out)
+        current_fraction = min(
+            1.0,
+            (time.monotonic() - animation_started)
+            / max(1e-6, args.max_seconds - 4.0),
+        )
+        if current_fraction >= animation_state["next_frame_fraction"]:
+            append_frame(iteration, model)
+            animation_state["next_frame_fraction"] += 1.0 / max(
+                1, args.nb_frames
+            )
 
     model = train_model(
         equations,
@@ -1224,15 +1927,29 @@ if __name__ == "__main__":
         nb_iter=args.nb_iter,
         nb_samples=args.nb_samples,
         lr=args.lr,
+        min_lr=args.min_lr,
+        lr_schedule=args.lr_schedule,
         lr_gamma=args.lr_gamma,
         hidden_layers=args.hidden_layers,
         hidden_features=args.hidden_features,
         first_omega_0=args.omega_0,
+        hidden_omega_0=args.hidden_omega_0,
+        sampling=args.sampling,
+        grouped=args.grouped,
+        penalty=args.penalty,
+        loss_balance=args.loss_balance,
+        seed=args.seed,
+        max_seconds=args.max_seconds,
         device=args.device,
         iteration_callback=None if args.no_gif else collect_frame,
     )
 
     if not args.no_gif:
+        if (
+            animation_state["last_frame_iteration"] is None
+            or len(frames) < args.nb_frames
+        ):
+            append_frame(args.nb_iter, model)
         solution = None
         if solution_functions:
             with torch.no_grad():

@@ -31,7 +31,7 @@ The solution section supports `x`, `y`, `pi`, numeric operators, and the
 functions `sqrt`, `sin`, `cos`, `exp`, `abs`, and `tanh`. It is used only for
 visual comparison and benchmarking; it never participates in training.
 
-The 36 files in [`examples`](examples) cover direct functions, gradients,
+The 37 files in [`examples`](examples) cover direct functions, gradients,
 ODEs, PDEs, nonlinear equations, coupled fields, and higher-frequency cases.
 
 For SIREN models, pure derivatives in `x` or `y` through fourth order are
@@ -44,17 +44,21 @@ higher-order expressions automatically fall back to PyTorch autograd.
 python solveanything.py --input_file examples/01_direct_bilinear.txt
 ```
 
-By default, this writes `out.gif`. If the file provides a `# Solution`, the GIF
-shows the evolving approximation in its first row and the analytic solution in
-its second row, using the same color scale for each output field.
+By default, this selects CUDA when available and trains the low-frequency SIREN
+configuration selected by the Re=100 cavity benchmark: frequencies `(3, 3)`,
+four hidden layers of width 256, grouped IID collocation sets of size 2048, MSE
+residuals, boundary-to-PDE loss ramping, and Adam with a `3e-4` to `1e-5`
+cosine schedule. Training has a 180-second wall-clock budget and a 50,000-step
+cap. This writes `out.gif`. If the file provides a `# Solution`, the GIF shows
+the evolving approximation in its first row and the analytic solution in its
+second row, using the same color scale for each output field.
 
 Use `--no_gif` to train without collecting or exporting animation frames. Run
 `python solveanything.py --help` for all model and training options.
 
 ## Benchmark a folder
 
-Run all problem files in `examples` with the solver's default SIREN and training
-parameters:
+Run all problem files in `examples` with a short 500-step regression profile:
 
 ```bash
 python benchmark.py examples
@@ -62,11 +66,82 @@ python benchmark.py examples
 
 The script resets the Torch seed before each problem, evaluates predictions on
 an 81 by 81 grid, and prints one absolute MSE (averaged across the grid and all
-output fields) per file in an ASCII table. Problems that fail are reported as
-`ERROR` without preventing the remaining files from running.
+output fields) per file in an ASCII table. Problems without a `# Solution`
+section are marked `SKIP`; problems that fail are reported as `ERROR` without
+preventing the remaining files from running.
 
 To benchmark one file while developing:
 
 ```bash
 python benchmark.py examples --pattern "01_direct_bilinear.txt"
 ```
+
+## Re=100 lid-driven-cavity benchmark
+
+`run_lid_driven_cavity_re100_benchmark.py` contains a focused 23-case follow-up
+to the original PINN/INR design of experiments for
+[`examples/37_lid_driven_cavity_re100.txt`](examples/37_lid_driven_cavity_re100.txt).
+Run the complete manifest on CUDA with:
+
+```bash
+python3 run_lid_driven_cavity_re100_benchmark.py --device cuda
+```
+
+Every case runs in an isolated process with a hard wall-clock limit of at most
+200 seconds and a PyTorch allocator cap of at most 8 GiB. Results are written
+after every case to resumable `results.json` and `results.csv` files under
+`benchmark_results/lid_driven_cavity_re100_followup`. Matching successful cases
+are skipped on a later invocation unless `--no-resume` is supplied.
+Each successful case also saves its final `u`, `v`, and `p` fields as
+`plots/<case-id>.png`, using the same orientation, labels, and field layout as
+the solver GIF.
+
+The active follow-up is organized around the first-round evidence:
+
+- **F (10):** controlled autodiff/finite-difference and SIREN/Fourier
+  comparisons, matched 6000-step caps, grid resolution, fourth-order stencils,
+  conservative momentum, and compatible hard constraints.
+- **G (6):** refinement of the successful low-frequency SIREN regime across
+  frequency, width, and depth.
+- **H (7):** boundary/interior sample allocation, loss-ramp ablation, fixed
+  Sobol points, and integral continuity with the low-frequency SIREN.
+
+The original 41 cases remain in `round1_manifest()`, but are not active. Two
+commented lines beside the manifest selection show how to re-enable that round
+with its original defaults.
+
+The sole ranking metric is
+
+```text
+E_Ghia = 0.5 * (relative_L2(u(0.5, y)) + relative_L2(v(x, 0.5)))
+```
+
+using the Re=100 centerline data from
+[Ghia, Ghia & Shin (1982)](https://doi.org/10.1016/0021-9991(82)90058-4).
+Lower is better. The reference values are used only after training, never in a
+loss or stopping rule.
+
+Inspect or select built-in cases and override common settings from the command
+line:
+
+```bash
+python3 run_lid_driven_cavity_re100_benchmark.py --list
+python3 run_lid_driven_cavity_re100_benchmark.py --device cuda --stage F
+python3 run_lid_driven_cavity_re100_benchmark.py --device cuda \
+  --case F01,F02,F03,F04
+python3 run_lid_driven_cavity_re100_benchmark.py --device cuda \
+  --case G02 --set hidden_features=192
+```
+
+For a JSON-controlled run, export the complete built-in manifest, edit any
+defaults or case-specific `config` objects, and pass it back to the runner:
+
+```bash
+python3 run_lid_driven_cavity_re100_benchmark.py \
+  --write-config cavity_benchmark.json
+python3 run_lid_driven_cavity_re100_benchmark.py \
+  --config cavity_benchmark.json --device cuda
+```
+
+Use `--dry-run`, `--help`, and `--list` to validate a selection without opening
+a CUDA context.

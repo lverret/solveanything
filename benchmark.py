@@ -18,19 +18,31 @@ DEFAULT_GRID_RESOLUTION = 81
 DEFAULT_SEED = 0
 
 
+class MissingAnalyticSolution(ValueError):
+    """Raised when a problem cannot be scored by the analytic benchmark."""
+
+
 def benchmark_problem(path, resolution, seed, device):
     """Train the default SIREN and return its aggregate absolute grid MSE."""
     equations, variables, domains, solution_functions = parse_problem_file(
         path, verbose=False
     )
     if not solution_functions:
-        raise ValueError(f"{path}: benchmark requires a '# Solution' section")
+        raise MissingAnalyticSolution(
+            f"{path}: benchmark requires a '# Solution' section"
+        )
 
     torch.manual_seed(seed)
     model = train_model(
         equations,
         variables,
         domains,
+        # Keep the folder sweep a short regression benchmark instead of using
+        # the 180-second cavity-oriented CLI budget for every analytic example.
+        nb_iter=500,
+        nb_samples=1000,
+        seed=seed,
+        max_seconds=None,
         device=device,
         progress=False,
     )
@@ -137,6 +149,8 @@ def main():
                 device=args.device,
             )
             rows.append((path.name, f"{mse:.8e}"))
+        except MissingAnalyticSolution:
+            rows.append((path.name, "SKIP"))
         except Exception as error:
             rows.append((path.name, "ERROR"))
             errors.append((path, error))
