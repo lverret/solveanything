@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the 41-case Re=100 lid-driven-cavity PINN/INR benchmark.
+"""Run the follow-up Re=100 lid-driven-cavity PINN/INR benchmark.
 
 The benchmark uses one ranking metric, ``E_Ghia``: the mean of the relative
 L2 errors for the predicted vertical and horizontal velocity centerlines
@@ -39,7 +39,9 @@ from solveanything import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "examples" / "37_lid_driven_cavity_re100.txt"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "benchmark_results" / "lid_driven_cavity_re100"
+DEFAULT_OUTPUT_DIR = (
+    SCRIPT_DIR / "benchmark_results" / "lid_driven_cavity_re100_followup"
+)
 MAX_SECONDS_ALLOWED = 200.0
 MAX_VRAM_GB_ALLOWED = 8.0
 FINAL_PLOT_RESOLUTION = 128
@@ -136,7 +138,7 @@ GHIA_V = np.array(
 )
 
 
-DEFAULT_TRAINING = {
+ROUND1_DEFAULT_TRAINING = {
     "architecture": "siren",
     "hidden_features": 256,
     "hidden_layers": 4,
@@ -174,6 +176,19 @@ DEFAULT_TRAINING = {
     "legacy_exact": False,
 }
 
+DEFAULT_TRAINING = {
+    **ROUND1_DEFAULT_TRAINING,
+    "first_omega_0": 3.0,
+    "hidden_omega_0": 3.0,
+    "loss_balance": "boundary_pde_ramp",
+    "lr": 3e-4,
+    "max_steps": 20000,
+    "max_seconds": 90.0,
+    "boundary_samples": None,
+    "fd_order": 2,
+    "fd_formulation": "advective",
+}
+
 
 def _case(case_id, stage, name, config=None, inherit_stages=None, finalist_rank=None):
     config = dict(config or {})
@@ -192,7 +207,7 @@ def _case(case_id, stage, name, config=None, inherit_stages=None, finalist_rank=
     }
 
 
-def built_in_manifest():
+def round1_manifest():
     """Return the staged 3 + 10 + 8 + 11 + 9 experiment manifest."""
     cases = [
         _case(
@@ -419,6 +434,175 @@ def built_in_manifest():
                 )
             )
     assert len(cases) == 41
+    return cases
+
+
+def built_in_manifest():
+    """Return focused experiments motivated by the first-round winners."""
+    fd_fourier = {
+        "architecture": "fourier_mlp",
+        "residual_mode": "finite_difference",
+        "fourier_sigma": 2.0,
+        "max_steps": 50000,
+        "max_seconds": 180.0,
+    }
+    cases = [
+        # F: determine whether the discrete winner is explained by architecture,
+        # derivative cost, update count, or the discrete operator itself.
+        _case(
+            "F01",
+            "F",
+            "Autodiff SIREN (3, 3), 6000-step cap",
+            {"max_steps": 6000, "max_seconds": 180.0},
+        ),
+        _case(
+            "F02",
+            "F",
+            "Finite-difference SIREN (3, 3), 6000-step cap",
+            {
+                "residual_mode": "finite_difference",
+                "max_steps": 6000,
+                "max_seconds": 180.0,
+            },
+        ),
+        _case(
+            "F03",
+            "F",
+            "Autodiff Fourier MLP sigma 2, 6000-step cap",
+            {
+                "architecture": "fourier_mlp",
+                "fourier_sigma": 2.0,
+                "max_steps": 6000,
+                "max_seconds": 180.0,
+            },
+        ),
+        _case(
+            "F04",
+            "F",
+            "Finite-difference Fourier MLP, 6000-step cap",
+            {**fd_fourier, "max_steps": 6000},
+        ),
+        _case(
+            "F05",
+            "F",
+            "Finite-difference Fourier MLP, throughput baseline",
+            fd_fourier,
+        ),
+        _case(
+            "F06",
+            "F",
+            "Finite difference on a 33x33 grid",
+            {**fd_fourier, "fd_resolution": 33, "max_seconds": 120.0},
+        ),
+        _case(
+            "F07",
+            "F",
+            "Finite difference on a 97x97 grid",
+            {**fd_fourier, "fd_resolution": 97},
+        ),
+        _case(
+            "F08",
+            "F",
+            "Fourth-order finite differences on a 65x65 grid",
+            {**fd_fourier, "fd_order": 4},
+        ),
+        _case(
+            "F09",
+            "F",
+            "Conservative finite-difference momentum residual",
+            {**fd_fourier, "fd_formulation": "conservative"},
+        ),
+        _case(
+            "F10",
+            "F",
+            "Finite difference with compatible hard constraints",
+            {**fd_fourier, "hard_constraints": True},
+        ),
+        # G: the Re=100 solution is smooth away from the lid corners, so refine
+        # the low-frequency/capacity region that beat every other autodiff INR.
+        _case(
+            "G01",
+            "G",
+            "Very-low-frequency SIREN (1, 1)",
+            {"first_omega_0": 1.0, "hidden_omega_0": 1.0},
+        ),
+        _case(
+            "G02",
+            "G",
+            "Low-frequency SIREN (2, 2)",
+            {"first_omega_0": 2.0, "hidden_omega_0": 2.0},
+        ),
+        _case(
+            "G03",
+            "G",
+            "Low-frequency SIREN (4, 4)",
+            {"first_omega_0": 4.0, "hidden_omega_0": 4.0},
+        ),
+        _case(
+            "G04",
+            "G",
+            "SIREN (3, 3), width 128",
+            {"hidden_features": 128},
+        ),
+        _case(
+            "G05",
+            "G",
+            "SIREN (3, 3), width 192",
+            {"hidden_features": 192},
+        ),
+        _case(
+            "G06",
+            "G",
+            "SIREN (3, 3), three hidden layers",
+            {"hidden_layers": 3},
+        ),
+        # H: grouped wall equations currently consume many more sampled values
+        # than the one shared interior cloud. Test that balance before adding
+        # more adaptive samplers, which were uniformly poor in round one.
+        _case(
+            "H01",
+            "H",
+            "SIREN with 256 samples per boundary",
+            {"boundary_samples": 256},
+        ),
+        _case(
+            "H02",
+            "H",
+            "SIREN with 512 samples per boundary",
+            {"boundary_samples": 512},
+        ),
+        _case(
+            "H03",
+            "H",
+            "SIREN with 1024 samples per boundary",
+            {"boundary_samples": 1024},
+        ),
+        _case(
+            "H04",
+            "H",
+            "SIREN with 1024 interior and 512 boundary samples",
+            {"samples": 1024, "boundary_samples": 512},
+        ),
+        _case(
+            "H05",
+            "H",
+            "SIREN without the boundary-to-PDE ramp",
+            {"loss_balance": "equal_groups"},
+        ),
+        _case(
+            "H06",
+            "H",
+            "Low-frequency SIREN with fixed Sobol points",
+            {"sampling": "fixed_sobol"},
+        ),
+        _case(
+            "H07",
+            "H",
+            "Low-frequency SIREN with integral continuity",
+            {"integral_continuity_weight": 0.1},
+        ),
+    ]
+    assert len(cases) == 23
     return cases
 
 
@@ -766,6 +950,11 @@ def pinn_loss(
 ):
     sample_counts = [int(config["samples"])] * len(equations)
     for index, domain in enumerate(domains):
+        if (
+            not is_interior(domain)
+            and config.get("boundary_samples") is not None
+        ):
+            sample_counts[index] = int(config["boundary_samples"])
         if not np.isnan(domain["x"]) and not np.isnan(domain["y"]):
             sample_counts[index] = 1
     _, evaluations = compute_equation_losses(
@@ -818,6 +1007,52 @@ def pinn_loss(
     return loss
 
 
+def finite_difference_operators(field, spacing, order):
+    """Return center values, first derivatives, and Laplacian on a grid."""
+    if order == 2:
+        center = field[1:-1, 1:-1]
+        derivative_x = (field[2:, 1:-1] - field[:-2, 1:-1]) / (2 * spacing)
+        derivative_y = (field[1:-1, 2:] - field[1:-1, :-2]) / (2 * spacing)
+        laplacian = (
+            field[2:, 1:-1]
+            + field[:-2, 1:-1]
+            + field[1:-1, 2:]
+            + field[1:-1, :-2]
+            - 4 * center
+        ) / spacing**2
+        return center, derivative_x, derivative_y, laplacian
+    if order == 4:
+        center = field[2:-2, 2:-2]
+        derivative_x = (
+            -field[4:, 2:-2]
+            + 8 * field[3:-1, 2:-2]
+            - 8 * field[1:-3, 2:-2]
+            + field[:-4, 2:-2]
+        ) / (12 * spacing)
+        derivative_y = (
+            -field[2:-2, 4:]
+            + 8 * field[2:-2, 3:-1]
+            - 8 * field[2:-2, 1:-3]
+            + field[2:-2, :-4]
+        ) / (12 * spacing)
+        second_x = (
+            -field[4:, 2:-2]
+            + 16 * field[3:-1, 2:-2]
+            - 30 * center
+            + 16 * field[1:-3, 2:-2]
+            - field[:-4, 2:-2]
+        ) / (12 * spacing**2)
+        second_y = (
+            -field[2:-2, 4:]
+            + 16 * field[2:-2, 3:-1]
+            - 30 * center
+            + 16 * field[2:-2, 1:-3]
+            - field[2:-2, :-4]
+        ) / (12 * spacing**2)
+        return center, derivative_x, derivative_y, second_x + second_y
+    raise ValueError(f"Unsupported finite-difference order {order}")
+
+
 def finite_difference_loss(model, field_indices, config, state, device):
     resolution = int(config["fd_resolution"])
     if "fd_coordinates" not in state:
@@ -830,22 +1065,40 @@ def finite_difference_loss(model, field_indices, config, state, device):
     v = outputs[:, :, field_indices["v"]]
     p = outputs[:, :, field_indices["p"]]
     spacing = 1 / (resolution - 1)
-    u_x = (u[2:, 1:-1] - u[:-2, 1:-1]) / (2 * spacing)
-    u_y = (u[1:-1, 2:] - u[1:-1, :-2]) / (2 * spacing)
-    v_x = (v[2:, 1:-1] - v[:-2, 1:-1]) / (2 * spacing)
-    v_y = (v[1:-1, 2:] - v[1:-1, :-2]) / (2 * spacing)
-    p_x = (p[2:, 1:-1] - p[:-2, 1:-1]) / (2 * spacing)
-    p_y = (p[1:-1, 2:] - p[1:-1, :-2]) / (2 * spacing)
-    u_laplacian = (
-        u[2:, 1:-1] + u[:-2, 1:-1] + u[1:-1, 2:] + u[1:-1, :-2] - 4 * u[1:-1, 1:-1]
-    ) / spacing**2
-    v_laplacian = (
-        v[2:, 1:-1] + v[:-2, 1:-1] + v[1:-1, 2:] + v[1:-1, :-2] - 4 * v[1:-1, 1:-1]
-    ) / spacing**2
-    interior_u = u[1:-1, 1:-1]
-    interior_v = v[1:-1, 1:-1]
-    momentum_u = interior_u * u_x + interior_v * u_y + p_x - 0.01 * u_laplacian
-    momentum_v = interior_u * v_x + interior_v * v_y + p_y - 0.01 * v_laplacian
+    order = int(config.get("fd_order", 2))
+    interior_u, u_x, u_y, u_laplacian = finite_difference_operators(
+        u, spacing, order
+    )
+    interior_v, v_x, v_y, v_laplacian = finite_difference_operators(
+        v, spacing, order
+    )
+    _, p_x, p_y, _ = finite_difference_operators(p, spacing, order)
+    formulation = config.get("fd_formulation", "advective")
+    if formulation == "advective":
+        momentum_u = (
+            interior_u * u_x
+            + interior_v * u_y
+            + p_x
+            - 0.01 * u_laplacian
+        )
+        momentum_v = (
+            interior_u * v_x
+            + interior_v * v_y
+            + p_y
+            - 0.01 * v_laplacian
+        )
+    elif formulation == "conservative":
+        _, u_squared_x, _, _ = finite_difference_operators(
+            u.square(), spacing, order
+        )
+        _, uv_x, uv_y, _ = finite_difference_operators(u * v, spacing, order)
+        _, _, v_squared_y, _ = finite_difference_operators(
+            v.square(), spacing, order
+        )
+        momentum_u = u_squared_x + uv_y + p_x - 0.01 * u_laplacian
+        momentum_v = uv_x + v_squared_y + p_y - 0.01 * v_laplacian
+    else:
+        raise ValueError(f"Unknown finite-difference formulation {formulation!r}")
     continuity = u_x + v_y
     pde = torch.stack(
         [
@@ -1133,6 +1386,25 @@ def validate_config(config):
         )
     if int(config["samples"]) < 1 or int(config["max_steps"]) < 1:
         raise ValueError("samples and max_steps must be positive")
+    boundary_samples = config.get("boundary_samples")
+    if boundary_samples is not None and int(boundary_samples) < 1:
+        raise ValueError("boundary_samples must be positive or null")
+    fd_order = int(config.get("fd_order", 2))
+    if fd_order not in {2, 4}:
+        raise ValueError("fd_order must be 2 or 4")
+    minimum_resolution = 5 if fd_order == 2 else 7
+    if int(config["fd_resolution"]) < minimum_resolution:
+        raise ValueError(
+            f"fd_resolution must be at least {minimum_resolution} for "
+            f"order {fd_order}"
+        )
+    if config.get("fd_formulation", "advective") not in {
+        "advective",
+        "conservative",
+    }:
+        raise ValueError(
+            "fd_formulation must be 'advective' or 'conservative'"
+        )
 
 
 def load_user_config(path, manifest, defaults):
@@ -1461,6 +1733,9 @@ def run(args):
         return run_worker(args.worker_spec)
     manifest = built_in_manifest()
     defaults = copy.deepcopy(DEFAULT_TRAINING)
+    # To rerun the original DOE instead, replace the preceding two lines with:
+    # manifest = round1_manifest()
+    # defaults = copy.deepcopy(ROUND1_DEFAULT_TRAINING)
     manifest, defaults, file_run_config = load_user_config(
         args.config, manifest, defaults
     )
@@ -1622,7 +1897,7 @@ def run(args):
 
 def make_parser():
     parser = argparse.ArgumentParser(
-        description="Run the 41-case Re=100 lid-driven-cavity PINN benchmark"
+        description="Run the follow-up Re=100 lid-driven-cavity PINN benchmark"
     )
     parser.add_argument("--config", type=Path, help="JSON configuration/manifest")
     parser.add_argument(
@@ -1643,7 +1918,7 @@ def make_parser():
         "--stage",
         action="append",
         default=[],
-        choices=list("ABCDE"),
+        choices=list("ABCDEFGH"),
         help="run a stage; repeatable",
     )
     parser.add_argument(

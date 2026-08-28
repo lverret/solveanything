@@ -78,8 +78,8 @@ python benchmark.py examples --pattern "01_direct_bilinear.txt"
 
 ## Re=100 lid-driven-cavity benchmark
 
-`run_lid_driven_cavity_re100_benchmark.py` contains the staged 41-case
-PINN/INR design of experiments for
+`run_lid_driven_cavity_re100_benchmark.py` contains a focused 23-case follow-up
+to the original PINN/INR design of experiments for
 [`examples/37_lid_driven_cavity_re100.txt`](examples/37_lid_driven_cavity_re100.txt).
 Run the complete manifest on CUDA with:
 
@@ -90,11 +90,25 @@ python3 run_lid_driven_cavity_re100_benchmark.py --device cuda
 Every case runs in an isolated process with a hard wall-clock limit of at most
 200 seconds and a PyTorch allocator cap of at most 8 GiB. Results are written
 after every case to resumable `results.json` and `results.csv` files under
-`benchmark_results/lid_driven_cavity_re100`. Matching successful cases are
-skipped on a later invocation unless `--no-resume` is supplied.
+`benchmark_results/lid_driven_cavity_re100_followup`. Matching successful cases
+are skipped on a later invocation unless `--no-resume` is supplied.
 Each successful case also saves its final `u`, `v`, and `p` fields as
 `plots/<case-id>.png`, using the same orientation, labels, and field layout as
 the solver GIF.
+
+The active follow-up is organized around the first-round evidence:
+
+- **F (10):** controlled autodiff/finite-difference and SIREN/Fourier
+  comparisons, matched 6000-step caps, grid resolution, fourth-order stencils,
+  conservative momentum, and compatible hard constraints.
+- **G (6):** refinement of the successful low-frequency SIREN regime across
+  frequency, width, and depth.
+- **H (7):** boundary/interior sample allocation, loss-ramp ablation, fixed
+  Sobol points, and integral continuity with the low-frequency SIREN.
+
+The original 41 cases remain in `round1_manifest()`, but are not active. Two
+commented lines beside the manifest selection show how to re-enable that round
+with its original defaults.
 
 The sole ranking metric is
 
@@ -112,16 +126,12 @@ line:
 
 ```bash
 python3 run_lid_driven_cavity_re100_benchmark.py --list
-python3 run_lid_driven_cavity_re100_benchmark.py --device cuda --stage A
+python3 run_lid_driven_cavity_re100_benchmark.py --device cuda --stage F
 python3 run_lid_driven_cavity_re100_benchmark.py --device cuda \
-  --case B01,B02,B03 --max-seconds 120 --samples 4096
+  --case F01,F02,F03,F04
 python3 run_lid_driven_cavity_re100_benchmark.py --device cuda \
-  --case D05 --set hidden_features=192 --set fourier_sigma=3.0
+  --case G02 --set hidden_features=192
 ```
-
-Stages C and D inherit the best available earlier recipe. Stage E expands the
-best three B-D cases to seeds 0, 1, and 2, so run the full manifest in order or
-reuse an output directory that already contains the prerequisite results.
 
 For a JSON-controlled run, export the complete built-in manifest, edit any
 defaults or case-specific `config` objects, and pass it back to the runner:
