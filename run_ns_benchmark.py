@@ -288,6 +288,8 @@ DEFAULT_TRAINING = {
     "residual_mode": "autodiff",
     "fd_resolution": 65,
     "fd_order": 2,
+    "fd_time_resolution": 17,
+    "fd_time_slices": 1,
     "artifact_resolution": 96,
     "video_frames": 32,
     "video_fps": 8,
@@ -347,6 +349,7 @@ def built_in_problems():
                 "delta_p": 0.11752016697,
             },
             "mean_velocity": 0.2,
+            "inlet_peak": 0.3,
             "enabled": True,
         },
         {
@@ -365,6 +368,7 @@ def built_in_problems():
                 "delta_p_t8": 0.1116,
             },
             "mean_velocity": 1.0,
+            "inlet_peak": 1.5,
             "enabled": True,
         },
         {
@@ -440,7 +444,6 @@ def built_in_approaches():
         {
             "id": "fd_fourier",
             "name": "Structured finite differences + Fourier MLP",
-            "families": ["cavity"],
             "config": {
                 "architecture": "fourier_mlp",
                 "residual_mode": "finite_difference",
@@ -505,68 +508,279 @@ def combine_losses(equation_losses, domains, strategy, progress):
     raise ValueError(f"Unknown loss balance {strategy!r}")
 
 
-def fd_operators(field, spacing, order):
-    """Second/fourth-order spatial stencils used by the cavity ablation."""
+def fd_spatial_axes(problem, config, state, periodic=False):
+    """Build a fixed, aspect-ratio-aware Cartesian grid for one run."""
+    cache_key = "fd_periodic_axes" if periodic else "fd_spatial_axes"
+    if cache_key in state:
+        return state[cache_key]
+    x_lower, x_upper = map(float, problem["bounds"]["x"])
+    y_lower, y_upper = map(float, problem["bounds"]["y"])
+    width = x_upper - x_lower
+    height = y_upper - y_lower
+    if width <= 0 or height <= 0:
+        raise ValueError("Finite-difference bounds must have positive extent")
+    target_intervals = int(config["fd_resolution"]) - 1
+    aspect_root = math.sqrt(width / height)
+    stencil_radius = 1 if int(config["fd_order"]) == 2 else 2
+    minimum_intervals = 2 * stencil_radius
+    x_intervals = max(
+        minimum_intervals, round(target_intervals * aspect_root)
+    )
+    y_intervals = max(
+        minimum_intervals, round(target_intervals / aspect_root)
+    )
+    if periodic:
+        x_axis = torch.linspace(
+            x_lower, x_upper, x_intervals + 1, device=state["device"]
+        )[:-1]
+        y_axis = torch.linspace(
+            y_lower, y_upper, y_intervals + 1, device=state["device"]
+        )[:-1]
+    else:
+        x_axis = torch.linspace(
+            x_lower, x_upper, x_intervals + 1, device=state["device"]
+        )
+        y_axis = torch.linspace(
+            y_lower, y_upper, y_intervals + 1, device=state["device"]
+        )
+    state[cache_key] = (
+        x_axis,
+        y_axis,
+        width / x_intervals,
+        height / y_intervals,
+    )
+    return state[cache_key]
+
+
+def evaluate_fd_grid(model, x_axis, y_axis, time_values=None):
+    """Evaluate a coordinate model on a spatial or space-time tensor grid."""
+    if time_values is None:
+        x, y = torch.meshgrid(x_axis, y_axis, indexing="ij")
+        output = model(x.reshape(-1, 1), y.reshape(-1, 1))
+        return output.reshape(len(x_axis), len(y_axis), -1)
+    t, x, y = torch.meshgrid(time_values, x_axis, y_axis, indexing="ij")
+    output = model(
+        x.reshape(-1, 1), y.reshape(-1, 1), t.reshape(-1, 1)
+    )
+    return output.reshape(len(time_values), len(x_axis), len(y_axis), -1)
+
+
+def fd_time_centers(problem, config, state):
+    """Cycle a small batch through the valid central time-stencil levels."""
+    lower, upper = map(float, problem["bounds"]["t"])
+    resolution = int(config["fd_time_resolution"])
+    spacing = (upper - lower) / (resolution - 1)
+    radius = 1 if int(config["fd_order"]) == 2 else 2
+    valid_indices = list(range(radius, resolution - radius))
+    batch_size = min(int(config["fd_time_slices"]), len(valid_indices))
+    cursor = int(state.get("fd_time_cursor", 0))
+    selected = [
+        valid_indices[(cursor + offset) % len(valid_indices)]
+        for offset in range(batch_size)
+    ]
+    state["fd_time_cursor"] = (cursor + batch_size) % len(valid_indices)
+    times = torch.tensor(
+        [lower + index * spacing for index in selected],
+        device=state["device"],
+    )
+    return times, spacing
+
+
+def temporal_fd_output(model, x_axis, y_axis, times, spacing, order):
+    """Evaluate central time values and their finite-difference derivatives."""
+    offsets = (-1, 0, 1) if order == 2 else (-2, -1, 0, 1, 2)
+    all_times = torch.cat([times + offset * spacing for offset in offsets])
+    all_output = evaluate_fd_grid(model, x_axis, y_axis, all_times)
+    frames = all_output.chunk(len(offsets), dim=0)
     if order == 2:
-        center = field[1:-1, 1:-1]
-        derivative_x = (field[2:, 1:-1] - field[:-2, 1:-1]) / (2 * spacing)
-        derivative_y = (field[1:-1, 2:] - field[1:-1, :-2]) / (2 * spacing)
+        derivative = (frames[2] - frames[0]) / (2 * spacing)
+        center = frames[1]
+    elif order == 4:
+        derivative = (
+            frames[0] - 8 * frames[1] + 8 * frames[3] - frames[4]
+        ) / (12 * spacing)
+        center = frames[2]
+    else:
+        raise ValueError("fd_order must be 2 or 4")
+    return center, derivative
+
+
+def fd_operators(field, spacing_x, spacing_y, order):
+    """Return centered spatial derivatives on the last two tensor axes."""
+    if order == 2:
+        center = field[..., 1:-1, 1:-1]
+        derivative_x = (
+            field[..., 2:, 1:-1] - field[..., :-2, 1:-1]
+        ) / (2 * spacing_x)
+        derivative_y = (
+            field[..., 1:-1, 2:] - field[..., 1:-1, :-2]
+        ) / (2 * spacing_y)
         laplacian = (
-            field[2:, 1:-1]
-            + field[:-2, 1:-1]
-            + field[1:-1, 2:]
-            + field[1:-1, :-2]
-            - 4 * center
-        ) / spacing**2
+            (
+                field[..., 2:, 1:-1]
+                - 2 * center
+                + field[..., :-2, 1:-1]
+            )
+            / spacing_x**2
+            + (
+                field[..., 1:-1, 2:]
+                - 2 * center
+                + field[..., 1:-1, :-2]
+            )
+            / spacing_y**2
+        )
         return center, derivative_x, derivative_y, laplacian
     if order == 4:
-        center = field[2:-2, 2:-2]
+        center = field[..., 2:-2, 2:-2]
         derivative_x = (
-            -field[4:, 2:-2]
-            + 8 * field[3:-1, 2:-2]
-            - 8 * field[1:-3, 2:-2]
-            + field[:-4, 2:-2]
-        ) / (12 * spacing)
+            -field[..., 4:, 2:-2]
+            + 8 * field[..., 3:-1, 2:-2]
+            - 8 * field[..., 1:-3, 2:-2]
+            + field[..., :-4, 2:-2]
+        ) / (12 * spacing_x)
         derivative_y = (
-            -field[2:-2, 4:]
-            + 8 * field[2:-2, 3:-1]
-            - 8 * field[2:-2, 1:-3]
-            + field[2:-2, :-4]
-        ) / (12 * spacing)
+            -field[..., 2:-2, 4:]
+            + 8 * field[..., 2:-2, 3:-1]
+            - 8 * field[..., 2:-2, 1:-3]
+            + field[..., 2:-2, :-4]
+        ) / (12 * spacing_y)
         second_x = (
-            -field[4:, 2:-2]
-            + 16 * field[3:-1, 2:-2]
+            -field[..., 4:, 2:-2]
+            + 16 * field[..., 3:-1, 2:-2]
             - 30 * center
-            + 16 * field[1:-3, 2:-2]
-            - field[:-4, 2:-2]
-        ) / (12 * spacing**2)
+            + 16 * field[..., 1:-3, 2:-2]
+            - field[..., :-4, 2:-2]
+        ) / (12 * spacing_x**2)
         second_y = (
-            -field[2:-2, 4:]
-            + 16 * field[2:-2, 3:-1]
+            -field[..., 2:-2, 4:]
+            + 16 * field[..., 2:-2, 3:-1]
             - 30 * center
-            + 16 * field[2:-2, 1:-3]
-            - field[2:-2, :-4]
-        ) / (12 * spacing**2)
+            + 16 * field[..., 2:-2, 1:-3]
+            - field[..., 2:-2, :-4]
+        ) / (12 * spacing_y**2)
         return center, derivative_x, derivative_y, second_x + second_y
     raise ValueError("fd_order must be 2 or 4")
 
 
+def periodic_fd_operators(field, spacing_x, spacing_y, order):
+    """Return centered derivatives with periodic wrapping in both axes."""
+    if order == 2:
+        derivative_x = (
+            torch.roll(field, -1, dims=-2) - torch.roll(field, 1, dims=-2)
+        ) / (2 * spacing_x)
+        derivative_y = (
+            torch.roll(field, -1, dims=-1) - torch.roll(field, 1, dims=-1)
+        ) / (2 * spacing_y)
+        laplacian = (
+            (
+                torch.roll(field, -1, dims=-2)
+                - 2 * field
+                + torch.roll(field, 1, dims=-2)
+            )
+            / spacing_x**2
+            + (
+                torch.roll(field, -1, dims=-1)
+                - 2 * field
+                + torch.roll(field, 1, dims=-1)
+            )
+            / spacing_y**2
+        )
+        return field, derivative_x, derivative_y, laplacian
+    if order == 4:
+        derivative_x = (
+            -torch.roll(field, -2, dims=-2)
+            + 8 * torch.roll(field, -1, dims=-2)
+            - 8 * torch.roll(field, 1, dims=-2)
+            + torch.roll(field, 2, dims=-2)
+        ) / (12 * spacing_x)
+        derivative_y = (
+            -torch.roll(field, -2, dims=-1)
+            + 8 * torch.roll(field, -1, dims=-1)
+            - 8 * torch.roll(field, 1, dims=-1)
+            + torch.roll(field, 2, dims=-1)
+        ) / (12 * spacing_y)
+        second_x = (
+            -torch.roll(field, -2, dims=-2)
+            + 16 * torch.roll(field, -1, dims=-2)
+            - 30 * field
+            + 16 * torch.roll(field, 1, dims=-2)
+            - torch.roll(field, 2, dims=-2)
+        ) / (12 * spacing_x**2)
+        second_y = (
+            -torch.roll(field, -2, dims=-1)
+            + 16 * torch.roll(field, -1, dims=-1)
+            - 30 * field
+            + 16 * torch.roll(field, 1, dims=-1)
+            - torch.roll(field, 2, dims=-1)
+        ) / (12 * spacing_y**2)
+        return field, derivative_x, derivative_y, second_x + second_y
+    raise ValueError("fd_order must be 2 or 4")
+
+
+def fluid_stencil_mask(fluid_mask, order):
+    """Select centers whose complete axial stencil remains in the fluid."""
+    radius = 1 if order == 2 else 2
+    nx, ny = fluid_mask.shape
+    valid = fluid_mask[radius : nx - radius, radius : ny - radius].clone()
+    for offset in range(1, radius + 1):
+        valid &= fluid_mask[
+            radius + offset : nx - radius + offset,
+            radius : ny - radius,
+        ]
+        valid &= fluid_mask[
+            radius - offset : nx - radius - offset,
+            radius : ny - radius,
+        ]
+        valid &= fluid_mask[
+            radius : nx - radius,
+            radius + offset : ny - radius + offset,
+        ]
+        valid &= fluid_mask[
+            radius : nx - radius,
+            radius - offset : ny - radius - offset,
+        ]
+    if not valid.any():
+        raise ValueError("Finite-difference grid has no complete fluid stencil")
+    return valid
+
+
+def masked_mean_square(value, mask):
+    """Mean square over a shared two-dimensional mask and leading batches."""
+    reshaped = value.reshape(-1, *mask.shape)
+    return reshaped[:, mask].square().mean()
+
+
+def backward_fd_x(field, spacing, order):
+    """One-sided x derivative at the right boundary."""
+    if order == 2:
+        return (
+            3 * field[..., -1, :]
+            - 4 * field[..., -2, :]
+            + field[..., -3, :]
+        ) / (2 * spacing)
+    if order == 4:
+        return (
+            25 * field[..., -1, :]
+            - 48 * field[..., -2, :]
+            + 36 * field[..., -3, :]
+            - 16 * field[..., -4, :]
+            + 3 * field[..., -5, :]
+        ) / (12 * spacing)
+    raise ValueError("fd_order must be 2 or 4")
+
+
 def cavity_fd_loss(model, field_indices, problem, config, state):
-    resolution = int(config["fd_resolution"])
-    if "fd_coordinates" not in state:
-        axis = torch.linspace(0, 1, resolution, device=state["device"])
-        x, y = torch.meshgrid(axis, axis, indexing="ij")
-        state["fd_coordinates"] = (x.reshape(-1, 1), y.reshape(-1, 1))
-    x, y = state["fd_coordinates"]
-    output = model(x, y).reshape(resolution, resolution, -1)
+    x_axis, y_axis, spacing_x, spacing_y = fd_spatial_axes(
+        problem, config, state
+    )
+    output = evaluate_fd_grid(model, x_axis, y_axis)
     u = output[:, :, field_indices["u"]]
     v = output[:, :, field_indices["v"]]
     p = output[:, :, field_indices["p"]]
-    spacing = 1 / (resolution - 1)
     order = int(config["fd_order"])
-    uc, ux, uy, ulap = fd_operators(u, spacing, order)
-    vc, vx, vy, vlap = fd_operators(v, spacing, order)
-    _, px, py, _ = fd_operators(p, spacing, order)
+    uc, ux, uy, ulap = fd_operators(u, spacing_x, spacing_y, order)
+    vc, vx, vy, vlap = fd_operators(v, spacing_x, spacing_y, order)
+    _, px, py, _ = fd_operators(p, spacing_x, spacing_y, order)
     nu = float(problem["viscosity"])
     pde = torch.stack(
         [
@@ -589,6 +803,247 @@ def cavity_fd_loss(model, field_indices, problem, config, state):
         ]
     ).mean()
     return 0.5 * (boundary + pde)
+
+
+def cylinder_fd_loss(model, field_indices, problem, config, state):
+    """Masked Cartesian finite differences for steady or transient DFG flow."""
+    x_axis, y_axis, spacing_x, spacing_y = fd_spatial_axes(
+        problem, config, state
+    )
+    order = int(config["fd_order"])
+    temporal = "t" in problem["bounds"]
+    if temporal:
+        times, spacing_t = fd_time_centers(problem, config, state)
+        output, time_derivative = temporal_fd_output(
+            model, x_axis, y_axis, times, spacing_t, order
+        )
+    else:
+        times = None
+        output = evaluate_fd_grid(model, x_axis, y_axis).unsqueeze(0)
+        time_derivative = None
+    u = output[..., field_indices["u"]]
+    v = output[..., field_indices["v"]]
+    p = output[..., field_indices["p"]]
+    uc, ux, uy, ulap = fd_operators(u, spacing_x, spacing_y, order)
+    vc, vx, vy, vlap = fd_operators(v, spacing_x, spacing_y, order)
+    _, px, py, _ = fd_operators(p, spacing_x, spacing_y, order)
+
+    if "fd_fluid_mask" not in state:
+        x, y = torch.meshgrid(x_axis, y_axis, indexing="ij")
+        center_x, center_y = map(float, problem["obstacle"]["center"])
+        obstacle_radius = float(problem["obstacle"]["radius"])
+        fluid = (
+            (x - center_x).square() + (y - center_y).square()
+            > obstacle_radius**2
+        )
+        state["fd_fluid_mask"] = fluid
+        state["fd_valid_mask"] = fluid_stencil_mask(fluid, order)
+    fluid_mask = state["fd_fluid_mask"]
+    valid_mask = state["fd_valid_mask"]
+    stencil_radius = 1 if order == 2 else 2
+    nu = float(problem["viscosity"])
+    momentum_x = uc * ux + vc * uy + px - nu * ulap
+    momentum_y = uc * vx + vc * vy + py - nu * vlap
+    if temporal:
+        momentum_x = momentum_x + time_derivative[
+            :,
+            stencil_radius:-stencil_radius,
+            stencil_radius:-stencil_radius,
+            field_indices["u"],
+        ]
+        momentum_y = momentum_y + time_derivative[
+            :,
+            stencil_radius:-stencil_radius,
+            stencil_radius:-stencil_radius,
+            field_indices["v"],
+        ]
+    pde = torch.stack(
+        [
+            masked_mean_square(momentum_x, valid_mask),
+            masked_mean_square(momentum_y, valid_mask),
+            masked_mean_square(ux + vy, valid_mask),
+        ]
+    ).mean()
+
+    y_lower, y_upper = map(float, problem["bounds"]["y"])
+    height = y_upper - y_lower
+    inlet_peak = float(problem.get("inlet_peak", 1.5 if temporal else 0.3))
+    inlet_profile = (
+        4
+        * inlet_peak
+        * (y_axis - y_lower)
+        * (y_upper - y_axis)
+        / height**2
+    )
+    if temporal:
+        time_lower = float(problem["bounds"]["t"][0])
+        time_upper = float(problem["bounds"]["t"][1])
+        inlet_profile = (
+            torch.sin(
+                math.pi * (times - time_lower) / (time_upper - time_lower)
+            )[:, None]
+            * inlet_profile[None, :]
+        )
+    else:
+        inlet_profile = inlet_profile[None, :]
+    boundary_losses = [
+        (u[:, 0, :] - inlet_profile).square().mean(),
+        v[:, 0, :].square().mean(),
+        u[:, :, 0].square().mean(),
+        u[:, :, -1].square().mean(),
+        v[:, :, 0].square().mean(),
+        v[:, :, -1].square().mean(),
+    ]
+
+    angle_count = int(config["boundary_samples"])
+    theta = (
+        2
+        * math.pi
+        * torch.arange(angle_count, device=state["device"])
+        / angle_count
+    )
+    center_x, center_y = map(float, problem["obstacle"]["center"])
+    obstacle_radius = float(problem["obstacle"]["radius"])
+    circle_x = center_x + obstacle_radius * torch.cos(theta)
+    circle_y = center_y + obstacle_radius * torch.sin(theta)
+    if temporal:
+        time_grid, theta_grid = torch.meshgrid(times, theta, indexing="ij")
+        circle_output = model(
+            (center_x + obstacle_radius * torch.cos(theta_grid)).reshape(-1, 1),
+            (center_y + obstacle_radius * torch.sin(theta_grid)).reshape(-1, 1),
+            time_grid.reshape(-1, 1),
+        )
+    else:
+        circle_output = model(circle_x[:, None], circle_y[:, None])
+    boundary_losses.extend(
+        [
+            circle_output[:, field_indices["u"]].square().mean(),
+            circle_output[:, field_indices["v"]].square().mean(),
+        ]
+    )
+
+    outlet_ux = backward_fd_x(u, spacing_x, order)
+    outlet_vx = backward_fd_x(v, spacing_x, order)
+    boundary_losses.extend(
+        [
+            (nu * outlet_ux - p[:, -1, :]).square().mean(),
+            outlet_vx.square().mean(),
+        ]
+    )
+    if temporal:
+        initial_time = torch.tensor(
+            [float(problem["bounds"]["t"][0])], device=state["device"]
+        )
+        initial = evaluate_fd_grid(model, x_axis, y_axis, initial_time)[0]
+        boundary_losses.extend(
+            [
+                initial[:, :, field_indices["u"]][fluid_mask].square().mean(),
+                initial[:, :, field_indices["v"]][fluid_mask].square().mean(),
+            ]
+        )
+    boundary = torch.stack(boundary_losses).mean()
+    return 0.5 * (boundary + pde)
+
+
+def taylor_green_fd_loss(model, field_indices, problem, config, state):
+    """Periodic space-time finite differences for the Taylor--Green vortex."""
+    x_axis, y_axis, spacing_x, spacing_y = fd_spatial_axes(
+        problem, config, state, periodic=True
+    )
+    order = int(config["fd_order"])
+    times, spacing_t = fd_time_centers(problem, config, state)
+    output, time_derivative = temporal_fd_output(
+        model, x_axis, y_axis, times, spacing_t, order
+    )
+    u = output[..., field_indices["u"]]
+    v = output[..., field_indices["v"]]
+    p = output[..., field_indices["p"]]
+    uc, ux, uy, ulap = periodic_fd_operators(
+        u, spacing_x, spacing_y, order
+    )
+    vc, vx, vy, vlap = periodic_fd_operators(
+        v, spacing_x, spacing_y, order
+    )
+    _, px, py, _ = periodic_fd_operators(p, spacing_x, spacing_y, order)
+    nu = float(problem["viscosity"])
+    pde = torch.stack(
+        [
+            (
+                time_derivative[..., field_indices["u"]]
+                + uc * ux
+                + vc * uy
+                + px
+                - nu * ulap
+            ).square().mean(),
+            (
+                time_derivative[..., field_indices["v"]]
+                + uc * vx
+                + vc * vy
+                + py
+                - nu * vlap
+            ).square().mean(),
+            (ux + vy).square().mean(),
+        ]
+    ).mean()
+
+    initial_time = torch.tensor(
+        [float(problem["bounds"]["t"][0])], device=state["device"]
+    )
+    initial = evaluate_fd_grid(model, x_axis, y_axis, initial_time)[0]
+    x, y = torch.meshgrid(x_axis, y_axis, indexing="ij")
+    reference = torch.empty_like(initial)
+    reference[..., field_indices["u"]] = torch.sin(x) * torch.cos(y)
+    reference[..., field_indices["v"]] = -torch.cos(x) * torch.sin(y)
+    reference[..., field_indices["p"]] = 0.25 * (
+        torch.cos(2 * x) + torch.cos(2 * y)
+    )
+    initial_loss = (initial - reference).square().mean()
+
+    x_lower, x_upper = map(float, problem["bounds"]["x"])
+    y_lower, y_upper = map(float, problem["bounds"]["y"])
+    time_x, boundary_y = torch.meshgrid(times, y_axis, indexing="ij")
+    x_left = model(
+        torch.full_like(boundary_y, x_lower).reshape(-1, 1),
+        boundary_y.reshape(-1, 1),
+        time_x.reshape(-1, 1),
+    )
+    x_right = model(
+        torch.full_like(boundary_y, x_upper).reshape(-1, 1),
+        boundary_y.reshape(-1, 1),
+        time_x.reshape(-1, 1),
+    )
+    time_y, boundary_x = torch.meshgrid(times, x_axis, indexing="ij")
+    y_bottom = model(
+        boundary_x.reshape(-1, 1),
+        torch.full_like(boundary_x, y_lower).reshape(-1, 1),
+        time_y.reshape(-1, 1),
+    )
+    y_top = model(
+        boundary_x.reshape(-1, 1),
+        torch.full_like(boundary_x, y_upper).reshape(-1, 1),
+        time_y.reshape(-1, 1),
+    )
+    boundary = torch.stack(
+        [
+            initial_loss,
+            (x_left - x_right).square().mean(),
+            (y_bottom - y_top).square().mean(),
+        ]
+    ).mean()
+    return 0.5 * (boundary + pde)
+
+
+def finite_difference_loss(model, field_indices, problem, config, state):
+    """Dispatch the structured finite-difference loss by problem family."""
+    if problem["family"] == "cavity":
+        return cavity_fd_loss(model, field_indices, problem, config, state)
+    if problem["family"] == "cylinder":
+        return cylinder_fd_loss(model, field_indices, problem, config, state)
+    if problem["family"] == "taylor_green":
+        return taylor_green_fd_loss(model, field_indices, problem, config, state)
+    raise ValueError(
+        f"Finite differences do not support family {problem['family']!r}"
+    )
 
 
 def build_run_model(config, variables, coordinate_names, device):
@@ -644,7 +1099,9 @@ def train_one(problem, config, equations, variables, domains, device, deadline):
         progress = training_progress(step, started, config, training_deadline)
         optimizer.zero_grad(set_to_none=True)
         if config["residual_mode"] == "finite_difference":
-            loss = cavity_fd_loss(model, field_indices, problem, config, state)
+            loss = finite_difference_loss(
+                model, field_indices, problem, config, state
+            )
         else:
             sample_counts = []
             for domain in domains:
@@ -1021,6 +1478,13 @@ def validate_config(config):
         raise ValueError(
             f"fd_resolution must be at least {minimum_fd_resolution}"
         )
+    minimum_time_resolution = 3 if int(config["fd_order"]) == 2 else 5
+    if int(config["fd_time_resolution"]) < minimum_time_resolution:
+        raise ValueError(
+            f"fd_time_resolution must be at least {minimum_time_resolution}"
+        )
+    if int(config["fd_time_slices"]) < 1:
+        raise ValueError("fd_time_slices must be positive")
 
 
 def compatible(problem, approach):

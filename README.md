@@ -113,8 +113,18 @@ References are used only after training:
 
 The default approaches are low-frequency and compact SIRENs, a tanh MLP, a
 Fourier-feature MLP, a modified gated MLP, and SIREN sampling/loss-balancing
-ablations. The previous structured finite-difference/Fourier winner remains
-available for compatible cavity cases.
+ablations. The structured finite-difference/Fourier approach is available for
+every built-in problem: it uses masked stencils and exact circle boundary
+samples for cylinders, and periodic space-time stencils for Taylor--Green.
+`fd_resolution` controls the approximate square root of the spatial point
+count while preserving a rectangular domain's aspect ratio. Transient runs
+cycle `fd_time_slices` central stencils through `fd_time_resolution` levels.
+For example, a fourth-order cylinder run can be selected with:
+
+```bash
+python3 run_ns_benchmark.py --device cuda --problem cylinder_re100 \
+  --approach fd_fourier --set fd_order=4
+```
 
 Each run executes in an isolated process with a hard limit of at most 200
 seconds and 8 GiB of allocated CUDA memory. Results are atomically persisted to
