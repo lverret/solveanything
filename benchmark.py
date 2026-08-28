@@ -41,6 +41,7 @@ def benchmark_problem(path, resolution, seed, device):
         # the 180-second cavity-oriented CLI budget for every analytic example.
         nb_iter=500,
         nb_samples=1000,
+        seed=seed,
         max_seconds=None,
         device=device,
         progress=False,
