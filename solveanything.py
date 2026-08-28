@@ -1,5 +1,6 @@
-import argparse
 import ast
+import copy
+import json
 import math
 import random
 import re
@@ -13,7 +14,9 @@ import torch.nn.functional as F
 from inspect import signature
 from tqdm import trange
 from PIL import Image
-from matplotlib.animation import FuncAnimation, PillowWriter
+
+
+COORDINATE_NAMES = ("x", "y", "t")
 
 
 class InvalidFormula(Exception):
@@ -117,10 +120,10 @@ class Siren(torch.nn.Module):
         self.net.append(final_linear)
         self.net = torch.nn.Sequential(*self.net)
 
-    def forward(self, x, y):
-        return self.net(torch.cat([x, y], dim=-1))
+    def forward(self, *coordinates):
+        return self.net(torch.cat(coordinates, dim=-1))
 
-    def forward_with_derivatives(self, x, y, derivative_orders):
+    def forward_with_derivatives(self, *args):
         """Evaluate outputs and requested pure derivatives in one forward pass.
 
         SIREN derivatives can be propagated exactly through each linear and
@@ -128,54 +131,59 @@ class Siren(torch.nn.Module):
         while ordinary autograd still computes parameter gradients from the
         resulting residual loss.
         """
+        if len(args) < 2:
+            raise ValueError("Expected coordinates followed by derivative orders")
+        *coordinates, derivative_orders = args
+        if len(coordinates) != self.net[0].in_features:
+            raise ValueError(
+                f"Expected {self.net[0].in_features} coordinates, "
+                f"got {len(coordinates)}"
+            )
+        zero_order = (0,) * len(coordinates)
         derivative_orders = tuple(
             dict.fromkeys(
-                order for order in derivative_orders if order != (0, 0)
+                order for order in derivative_orders if order != zero_order
             )
         )
         if any(
-            x_order and y_order
-            or max(x_order, y_order) > MAX_ANALYTIC_DERIVATIVE_ORDER
-            for x_order, y_order in derivative_orders
+            len(order) != len(coordinates)
+            or sum(component > 0 for component in order) > 1
+            or max(order, default=0) > MAX_ANALYTIC_DERIVATIVE_ORDER
+            for order in derivative_orders
         ):
             raise ValueError("Only pure derivatives through fourth order are supported")
 
-        max_x_order = max(
-            (x_order for x_order, _ in derivative_orders), default=0
-        )
-        max_y_order = max(
-            (y_order for _, y_order in derivative_orders), default=0
-        )
-        value = torch.cat([x, y], dim=-1)
-        x_derivatives = [value]
-        y_derivatives = [value]
-        if max_x_order:
-            x_derivatives.extend(
-                [
-                    torch.cat([torch.ones_like(x), torch.zeros_like(y)], dim=-1),
-                    *[
-                        torch.zeros_like(value)
-                        for _ in range(max_x_order - 1)
-                    ],
-                ]
-            )
-        if max_y_order:
-            y_derivatives.extend(
-                [
-                    torch.cat([torch.zeros_like(x), torch.ones_like(y)], dim=-1),
-                    *[
-                        torch.zeros_like(value)
-                        for _ in range(max_y_order - 1)
-                    ],
-                ]
-            )
+        maximum_orders = [
+            max((order[index] for order in derivative_orders), default=0)
+            for index in range(len(coordinates))
+        ]
+        value = torch.cat(coordinates, dim=-1)
+        coordinate_derivatives = []
+        for coordinate_index, maximum_order in enumerate(maximum_orders):
+            derivatives = [value]
+            if maximum_order:
+                basis = torch.zeros_like(value)
+                basis[:, coordinate_index : coordinate_index + 1] = 1
+                derivatives.extend(
+                    [
+                        basis,
+                        *[
+                            torch.zeros_like(value)
+                            for _ in range(maximum_order - 1)
+                        ],
+                    ]
+                )
+            coordinate_derivatives.append(derivatives)
 
         batch_size = value.size(0)
         for layer in self.net[:-1]:
             derivative_inputs = [
                 value,
-                *x_derivatives[1:],
-                *y_derivatives[1:],
+                *[
+                    derivative
+                    for derivatives in coordinate_derivatives
+                    for derivative in derivatives[1:]
+                ],
             ]
             transformed = F.linear(
                 torch.cat(derivative_inputs, dim=0), layer.linear.weight
@@ -184,48 +192,41 @@ class Siren(torch.nn.Module):
             sine = torch.sin(argument)
             cosine = torch.cos(argument)
             offset = 1
-
-            if max_x_order:
-                x_arguments = [
-                    argument,
-                    *(
-                        layer.omega_0 * derivative
-                        for derivative in transformed[
-                            offset : offset + max_x_order
-                        ]
-                    ),
-                ]
-                x_derivatives = _sine_derivatives(x_arguments, sine, cosine)
-                value = x_derivatives[0]
-                offset += max_x_order
-            if max_y_order:
-                y_arguments = [
-                    argument,
-                    *(
-                        layer.omega_0 * derivative
-                        for derivative in transformed[
-                            offset : offset + max_y_order
-                        ]
-                    ),
-                ]
-                y_derivatives = _sine_derivatives(y_arguments, sine, cosine)
-                value = y_derivatives[0]
-            if not max_x_order and not max_y_order:
-                value = sine
-
-            x_derivatives[0] = value
-            y_derivatives[0] = value
+            next_derivatives = []
+            for maximum_order in maximum_orders:
+                if maximum_order:
+                    arguments = [
+                        argument,
+                        *(
+                            layer.omega_0 * derivative
+                            for derivative in transformed[
+                                offset : offset + maximum_order
+                            ]
+                        ),
+                    ]
+                    derivatives = _sine_derivatives(arguments, sine, cosine)
+                    offset += maximum_order
+                else:
+                    derivatives = [sine]
+                next_derivatives.append(derivatives)
+            coordinate_derivatives = next_derivatives
+            value = sine
+            for derivatives in coordinate_derivatives:
+                derivatives[0] = value
 
         final_layer = self.net[-1]
         requested_inputs = [value]
-        for x_order, y_order in derivative_orders:
+        for order in derivative_orders:
+            coordinate_index = next(
+                index for index, component in enumerate(order) if component
+            )
             requested_inputs.append(
-                x_derivatives[x_order] if x_order else y_derivatives[y_order]
+                coordinate_derivatives[coordinate_index][order[coordinate_index]]
             )
         transformed = F.linear(
             torch.cat(requested_inputs, dim=0), final_layer.weight
         ).split(batch_size, dim=0)
-        outputs = {(0, 0): transformed[0] + final_layer.bias}
+        outputs = {zero_order: transformed[0] + final_layer.bias}
         outputs.update(
             {
                 order: derivative
@@ -297,8 +298,8 @@ class MLP(torch.nn.Module):
         layers.append(linear(hidden_features, out_features))
         self.net = torch.nn.Sequential(*layers)
 
-    def forward(self, x, y):
-        return self.net(torch.cat([x, y], dim=-1))
+    def forward(self, *coordinates):
+        return self.net(torch.cat(coordinates, dim=-1))
 
 
 class FourierFeatureMLP(torch.nn.Module):
@@ -327,8 +328,8 @@ class FourierFeatureMLP(torch.nn.Module):
             activation=activation,
         )
 
-    def forward(self, x, y):
-        coordinates = torch.cat([x, y], dim=-1)
+    def forward(self, *inputs):
+        coordinates = torch.cat(inputs, dim=-1)
         phase = 2 * np.pi * coordinates @ self.projection
         features = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
         midpoint = features.size(-1) // 2
@@ -357,8 +358,8 @@ class ModifiedMLP(torch.nn.Module):
         )
         self.output_layer = torch.nn.Linear(hidden_features, out_features)
 
-    def forward(self, x, y):
-        coordinates = torch.cat([x, y], dim=-1)
+    def forward(self, *inputs):
+        coordinates = torch.cat(inputs, dim=-1)
         encoder_u = self.activation(self.encoder_u(coordinates))
         encoder_v = self.activation(self.encoder_v(coordinates))
         hidden = self.activation(self.input_layer(coordinates))
@@ -396,8 +397,8 @@ class PirateNet(torch.nn.Module):
             self.residual_scales.append(torch.nn.Parameter(torch.zeros(())))
         self.output_layer = torch.nn.Linear(hidden_features, out_features)
 
-    def forward(self, x, y):
-        hidden = self.activation(self.input_layer(torch.cat([x, y], dim=-1)))
+    def forward(self, *coordinates):
+        hidden = self.activation(self.input_layer(torch.cat(coordinates, dim=-1)))
         for block, scale in zip(self.blocks, self.residual_scales):
             hidden = hidden + scale * block(hidden)
         return self.output_layer(hidden)
@@ -431,8 +432,8 @@ class MultiHeadMLP(torch.nn.Module):
             torch.nn.Linear(hidden_features, 1) for _ in range(out_features)
         )
 
-    def forward(self, x, y):
-        hidden = self.trunk(torch.cat([x, y], dim=-1))
+    def forward(self, *coordinates):
+        hidden = self.trunk(torch.cat(coordinates, dim=-1))
         return torch.cat([head(hidden) for head in self.heads], dim=-1)
 
 
@@ -447,6 +448,7 @@ def build_model(
     activation="tanh",
     fourier_features=64,
     fourier_sigma=2.0,
+    coordinate_names=None,
 ):
     """Build one of the coordinate-network backbones used by experiments."""
     architecture = architecture.lower()
@@ -490,6 +492,11 @@ def build_model(
                 architecture
             )
         )
+    if coordinate_names is None:
+        coordinate_names = COORDINATE_NAMES[:in_features]
+    if len(coordinate_names) != in_features:
+        raise ValueError("coordinate_names must match in_features")
+    model.coordinate_names = tuple(coordinate_names)
     return model
 
 
@@ -564,42 +571,293 @@ FUNS = {
 
 
 CONSTANTS = {"pi": np.pi}
-SECTION_PATTERN = re.compile(r"^\s*#\s*(Equations|Solution)\s*$", re.IGNORECASE)
+SECTION_PATTERN = re.compile(
+    r"^\s*#\s*(Domains|Equations|Solution)\s*$", re.IGNORECASE
+)
+DOMAIN_ANNOTATION = re.compile(
+    r"^(?P<formula>.+?)\s+@\s+(?P<domain>[A-Za-z_]\w*)\s*$"
+)
 
 # -----------------------------------------------------------------------------
 # Parser functions
 
 
-def parse_equations(equations, verbose=True):
+def _split_domain_annotation(formula):
+    match = DOMAIN_ANNOTATION.match(formula)
+    if match is None:
+        return formula, None
+    return match.group("formula").strip(), match.group("domain")
+
+
+def _geometry_scalar(node, formula):
+    if isinstance(node, ast.Constant):
+        value = node.value
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        operand = _geometry_scalar(node.operand, formula)
+        value = -operand if isinstance(node.op, ast.USub) else operand
+    elif isinstance(node, ast.Name) and node.id in CONSTANTS:
+        value = CONSTANTS[node.id]
+    elif (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, (ast.Mult, ast.Div, ast.Add, ast.Sub))
+    ):
+        left = _geometry_scalar(node.left, formula)
+        right = _geometry_scalar(node.right, formula)
+        value = OPS[type(node.op)](left, right)
+    else:
+        raise InvalidFormula(formula, "Geometry values must be numeric")
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        raise InvalidFormula(formula, "Geometry values must be numeric")
+    value = float(value)
+    if not math.isfinite(value):
+        raise InvalidFormula(formula, "Geometry values must be finite")
+    return value
+
+
+def _geometry_interval(node, formula, allow_scalar=True):
+    if isinstance(node, (ast.Tuple, ast.List)):
+        if len(node.elts) != 2:
+            raise InvalidFormula(formula, "Coordinate ranges need two endpoints")
+        lower, upper = (_geometry_scalar(item, formula) for item in node.elts)
+        if not lower < upper:
+            raise InvalidFormula(formula, "Coordinate ranges must be increasing")
+        return [lower, upper]
+    if not allow_scalar:
+        raise InvalidFormula(formula, "Expected a two-value range")
+    return _geometry_scalar(node, formula)
+
+
+def _parse_geometry_node(node, formula, named_geometries):
+    if isinstance(node, ast.Name):
+        try:
+            return copy.deepcopy(named_geometries[node.id])
+        except KeyError as error:
+            raise InvalidFormula(formula, f"Unknown domain {node.id!r}") from error
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        raise InvalidFormula(formula, "Expected a geometry constructor")
+    name = node.func.id.lower()
+    if name in {"difference", "union"}:
+        if node.keywords or len(node.args) < 2:
+            raise InvalidFormula(formula, f"{name} expects at least two domains")
+        parts = [
+            _parse_geometry_node(argument, formula, named_geometries)
+            for argument in node.args
+        ]
+        if name == "difference":
+            return {"type": "difference", "outer": parts[0], "holes": parts[1:]}
+        part_coordinates = {
+            _geometry_coordinate_names(part) for part in parts
+        }
+        if len(part_coordinates) != 1:
+            raise InvalidFormula(
+                formula, "union parts must use the same coordinates"
+            )
+        return {"type": "union", "parts": parts}
+    if node.args:
+        raise InvalidFormula(formula, f"{name} accepts keyword arguments only")
+    keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+    if None in keywords:
+        raise InvalidFormula(formula, "Expanded geometry keywords are unsupported")
+    if name in {"box", "rectangle"}:
+        unknown = set(keywords) - set(COORDINATE_NAMES)
+        if unknown or not {"x", "y"}.issubset(keywords):
+            raise InvalidFormula(
+                formula,
+                "box expects x and y ranges, with optional t",
+            )
+        coordinates = {
+            coordinate: _geometry_interval(value, formula)
+            for coordinate, value in keywords.items()
+        }
+        return {"type": "box", "coordinates": coordinates}
+    if name in {"circle", "disk"}:
+        unknown = set(keywords) - {"center", "radius", "t"}
+        if unknown or "center" not in keywords or "radius" not in keywords:
+            raise InvalidFormula(
+                formula,
+                f"{name} expects center=(x, y), radius=r, and optional t",
+            )
+        center_node = keywords["center"]
+        if not isinstance(center_node, (ast.Tuple, ast.List)) or len(center_node.elts) != 2:
+            raise InvalidFormula(formula, "center must contain x and y")
+        center = [_geometry_scalar(item, formula) for item in center_node.elts]
+        radius = _geometry_scalar(keywords["radius"], formula)
+        if radius <= 0:
+            raise InvalidFormula(formula, "radius must be positive")
+        geometry = {"type": name, "center": center, "radius": radius}
+        if "t" in keywords:
+            geometry["t"] = _geometry_interval(keywords["t"], formula)
+        return geometry
+    raise InvalidFormula(
+        formula,
+        "Unknown geometry; choose box, circle, disk, difference, or union",
+    )
+
+
+def parse_domain_definitions(domain_equations, input_file="<domains>"):
+    """Parse safe named geometry expressions from a ``# Domains`` section."""
+    named = {}
+    for line_number, formula in domain_equations:
+        parts = formula.split("=", 1)
+        if len(parts) != 2 or not re.fullmatch(r"[A-Za-z_]\w*", parts[0].strip()):
+            raise ValueError(
+                f"{input_file}:{line_number}: domain must have the form "
+                "'name = geometry(...)'"
+            )
+        name, expression = parts[0].strip(), parts[1].strip()
+        if name in named:
+            raise ValueError(f"{input_file}:{line_number}: duplicate domain {name!r}")
+        node = ast.parse(expression, filename=str(input_file), mode="eval").body
+        try:
+            named[name] = _parse_geometry_node(node, formula, named)
+        except InvalidFormula as error:
+            raise ValueError(f"{input_file}:{line_number}: {error}") from error
+    return named
+
+
+def _geometry_coordinate_names(geometry):
+    kind = geometry["type"]
+    if kind == "box":
+        return tuple(
+            coordinate
+            for coordinate in COORDINATE_NAMES
+            if coordinate in geometry["coordinates"]
+        )
+    if kind in {"circle", "disk"}:
+        return ("x", "y", "t") if "t" in geometry else ("x", "y")
+    if kind == "difference":
+        return _geometry_coordinate_names(geometry["outer"])
+    names = set()
+    for part in geometry["parts"]:
+        names.update(_geometry_coordinate_names(part))
+    return tuple(coordinate for coordinate in COORDINATE_NAMES if coordinate in names)
+
+
+def _geometry_bounds(geometry):
+    kind = geometry["type"]
+    if kind == "box":
+        return copy.deepcopy(geometry["coordinates"])
+    if kind in {"circle", "disk"}:
+        cx, cy = geometry["center"]
+        radius = geometry["radius"]
+        bounds = {"x": [cx - radius, cx + radius], "y": [cy - radius, cy + radius]}
+        if "t" in geometry:
+            bounds["t"] = copy.deepcopy(geometry["t"])
+        return bounds
+    if kind == "difference":
+        return _geometry_bounds(geometry["outer"])
+    part_bounds = [_geometry_bounds(part) for part in geometry["parts"]]
+    bounds = {}
+    for coordinate in _geometry_coordinate_names(geometry):
+        intervals = []
+        for item in part_bounds:
+            value = item[coordinate]
+            intervals.append(value if isinstance(value, list) else [value, value])
+        lower = min(value[0] for value in intervals)
+        upper = max(value[1] for value in intervals)
+        bounds[coordinate] = lower if lower == upper else [lower, upper]
+    return bounds
+
+
+def _domain_from_geometry(name, geometry, coordinate_names):
+    geometry_names = _geometry_coordinate_names(geometry)
+    if tuple(geometry_names) != tuple(coordinate_names):
+        raise ValueError(
+            f"Domain {name!r} uses coordinates {geometry_names}, expected "
+            f"{tuple(coordinate_names)}"
+        )
+    bounds = _geometry_bounds(geometry)
+    domain = {"_name": name, "_geometry": copy.deepcopy(geometry), "_bounds": bounds}
+    for coordinate in coordinate_names:
+        value = bounds[coordinate]
+        domain[coordinate] = float(value) if not isinstance(value, list) else np.nan
+    return domain
+
+
+def infer_coordinate_names(equations, named_geometries=None):
+    """Infer whether a problem uses ``(x, y)`` or ``(x, y, t)``."""
+    uses_time = False
+    for annotated_formula in equations:
+        formula, _ = _split_domain_annotation(annotated_formula)
+        for expression in formula.split("=", 1):
+            if any(
+                isinstance(node, ast.Name) and node.id == "t"
+                for node in ast.walk(ast.parse(expression.strip(), mode="eval"))
+            ):
+                uses_time = True
+                break
+        if uses_time:
+            break
+    if named_geometries:
+        uses_time = uses_time or any(
+            "t" in _geometry_coordinate_names(geometry)
+            for geometry in named_geometries.values()
+        )
+    return ("x", "y", "t") if uses_time else ("x", "y")
+
+
+def coordinate_names_from_domains(domains):
+    if not domains:
+        raise ValueError("At least one equation domain is required")
+    return tuple(
+        coordinate for coordinate in COORDINATE_NAMES if coordinate in domains[0]
+    )
+
+
+def parse_equations(equations, verbose=True, named_geometries=None):
+    named_geometries = named_geometries or {}
+    coordinate_names = infer_coordinate_names(equations, named_geometries)
+    named_domains = {
+        name: _domain_from_geometry(name, geometry, coordinate_names)
+        for name, geometry in named_geometries.items()
+    }
     variables = {}
     domains = []
-    for formula in equations:
+    for annotated_formula in equations:
+        formula, domain_name = _split_domain_annotation(annotated_formula)
         splits = formula.split("=")
         if len(splits) != 2:
             raise InvalidFormula(formula, "Not a equation")
         lhs, rhs = splits
-        fixed_coordinates = {"x": set(), "y": set()}
+        fixed_coordinates = {coordinate: set() for coordinate in coordinate_names}
         parse(
             formula,
             ast.parse(lhs.strip(), mode="eval").body,
             variables,
             fixed_coordinates,
+            coordinate_names=coordinate_names,
         )
         parse(
             formula,
             ast.parse(rhs.strip(), mode="eval").body,
             variables,
             fixed_coordinates,
+            coordinate_names=coordinate_names,
         )
-        domain = {
-            coordinate: next(iter(values)) if len(values) == 1 else np.nan
-            for coordinate, values in fixed_coordinates.items()
-        }
+        if domain_name is not None:
+            try:
+                domain = copy.deepcopy(named_domains[domain_name])
+            except KeyError as error:
+                raise InvalidFormula(formula, f"Unknown domain {domain_name!r}") from error
+        else:
+            domain = {
+                coordinate: next(iter(values)) if len(values) == 1 else np.nan
+                for coordinate, values in fixed_coordinates.items()
+            }
+            domain["_bounds"] = {
+                coordinate: (
+                    float(domain[coordinate])
+                    if not np.isnan(domain[coordinate])
+                    else [0.0, 1.0]
+                )
+                for coordinate in coordinate_names
+            }
         domains.append(domain)
         log = f"Parsed equation {len(domains)}: 'for "
-        for inp in ["x", "y"]:
+        for inp in coordinate_names:
             if np.isnan(domain[inp]):
-                log += f"{inp} in (0, 1), "
+                bounds = domain["_bounds"][inp]
+                log += f"{inp} in ({bounds[0]}, {bounds[1]}), "
             else:
                 log += f"{inp} = {domain[inp]}, "
         if verbose:
@@ -611,7 +869,7 @@ def parse_equations(equations, verbose=True):
 
 
 def _read_problem_sections(input_file):
-    sections = {"equations": [], "solution": []}
+    sections = {"domains": [], "equations": [], "solution": []}
     seen_sections = set()
     current_section = None
 
@@ -624,6 +882,10 @@ def _read_problem_sections(input_file):
                     raise ValueError(
                         f"{input_file}:{line_number}: duplicate "
                         f"'#{section_match.group(1)}' section"
+                    )
+                if section == "domains" and seen_sections:
+                    raise ValueError(
+                        f"{input_file}:{line_number}: '# Domains' must be first"
                     )
                 if section == "solution" and "equations" not in seen_sections:
                     raise ValueError(
@@ -640,7 +902,7 @@ def _read_problem_sections(input_file):
             if current_section is None:
                 raise ValueError(
                     f"{input_file}:{line_number}: content must be placed below "
-                    "'# Equations' or '# Solution'"
+                    "'# Domains', '# Equations', or '# Solution'"
                 )
             sections[current_section].append((line_number, line))
 
@@ -654,7 +916,9 @@ def _read_problem_sections(input_file):
     return sections, "solution" in seen_sections
 
 
-def _parse_solution_equations(solution_equations, input_file="<solution>"):
+def _parse_solution_equations(
+    solution_equations, coordinate_names, input_file="<solution>"
+):
     """Parse ``field = expression`` formulas from a ``# Solution`` section."""
     solution_functions = {}
     for line_number, formula in solution_equations:
@@ -681,9 +945,10 @@ def _parse_solution_equations(solution_equations, input_file="<solution>"):
             formula,
             node,
             variables={},
-            fixed_coordinates={"x": set(), "y": set()},
+            fixed_coordinates={coordinate: set() for coordinate in coordinate_names},
             functions=MATH_FUNS,
             allow_unknown_functions=False,
+            coordinate_names=coordinate_names,
         )
         solution_functions[field] = node
     return solution_functions
@@ -692,10 +957,19 @@ def _parse_solution_equations(solution_equations, input_file="<solution>"):
 def parse_problem_file(input_file, verbose=True):
     """Parse equations and an optional analytic solution from a problem file."""
     sections, has_solution = _read_problem_sections(input_file)
-    equations = [formula for _, formula in sections["equations"]]
-    variables, domains = parse_equations(equations, verbose=verbose)
+    annotated_equations = [formula for _, formula in sections["equations"]]
+    named_geometries = parse_domain_definitions(
+        sections["domains"], input_file=input_file
+    )
+    variables, domains = parse_equations(
+        annotated_equations, verbose=verbose, named_geometries=named_geometries
+    )
+    equations = [
+        _split_domain_annotation(formula)[0] for formula in annotated_equations
+    ]
+    coordinate_names = coordinate_names_from_domains(domains)
     solution_functions = _parse_solution_equations(
-        sections["solution"], input_file=input_file
+        sections["solution"], coordinate_names, input_file=input_file
     )
 
     if has_solution and set(solution_functions) != set(variables):
@@ -729,6 +1003,7 @@ def parse(
     fixed_coordinates,
     functions=None,
     allow_unknown_functions=True,
+    coordinate_names=("x", "y"),
 ):
     if functions is None:
         functions = FUNS
@@ -741,6 +1016,7 @@ def parse(
             fixed_coordinates,
             functions,
             allow_unknown_functions,
+            coordinate_names,
         )
 
     if isinstance(node, ast.Constant):
@@ -761,45 +1037,42 @@ def parse(
                 parse_child(arg)
             return variables
         elif isinstance(node.func, ast.Name) and allow_unknown_functions:
-            if not all(isinstance(arg, (ast.Constant, ast.Name)) for arg in node.args):
-                raise InvalidFormula(formula, f"Found invalid arg for '{node.func.id}'")
-            if len(node.args) != 2:
+            if len(node.args) != len(coordinate_names):
                 raise InvalidFormula(
                     formula, f"Invalid nb of args for '{node.func.id}'"
                 )
-            if (
-                isinstance(node.args[0], ast.Name)
-                and node.args[0].id != "x"
-                or isinstance(node.args[1], ast.Name)
-                and node.args[1].id != "y"
-            ):
-                raise InvalidFormula(
-                    formula, f"'{node.func.id}' takes as args only (x, y) in that order"
-                )
-            for inp, arg in zip(["x", "y"], node.args):
-                if isinstance(arg, ast.Constant):
-                    value = arg.value
-                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+            for coordinate, argument in zip(coordinate_names, node.args):
+                if isinstance(argument, ast.Name) and argument.id == coordinate:
+                    continue
+                try:
+                    _geometry_scalar(argument, formula)
+                except InvalidFormula as error:
+                    if isinstance(argument, ast.Name):
                         raise InvalidFormula(
-                            formula, f"Found invalid arg for '{node.func.id}'"
-                        )
-                    if not 0 <= value <= 1:
-                        raise InvalidFormula(
-                            formula, "Only functions in [0, 1] x [0, 1] are supported"
-                        )
-                    fixed_coordinates[inp].add(float(value))
+                            formula,
+                            f"'{node.func.id}' takes coordinates "
+                            f"{tuple(coordinate_names)} in that order",
+                        ) from error
+                    raise InvalidFormula(
+                        formula, f"Found invalid arg for '{node.func.id}'"
+                    ) from error
+            for inp, arg in zip(coordinate_names, node.args):
+                if not (isinstance(arg, ast.Name) and arg.id == inp):
+                    fixed_coordinates[inp].add(_geometry_scalar(arg, formula))
             variables[node.func.id] = None
             return variables
     elif isinstance(node, ast.Name):
-        if node.id in ["x", "y"] or node.id in CONSTANTS:
+        if node.id in coordinate_names or node.id in CONSTANTS:
             return variables
         elif allow_unknown_functions:
             parse_child(
                 ast.Call(
                     func=ast.Name(id=node.id, ctx=ast.Load()),
                     args=[
-                        ast.Name(id="x", ctx=ast.Load()),
-                        ast.Name(id="y", ctx=ast.Load()),
+                        *[
+                            ast.Name(id=coordinate, ctx=ast.Load())
+                            for coordinate in coordinate_names
+                        ],
                     ],
                     keywords=[],
                 ),
@@ -817,23 +1090,27 @@ def _record_coordinate(used_coordinates, coordinate, value):
 def _coordinate_value(node, coordinate, samples, coordinate_cache, used_coordinates):
     if isinstance(node, ast.Name):
         value = samples[coordinate]
-    elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        key = (coordinate, float(node.value))
+    else:
+        try:
+            numeric_value = _geometry_scalar(node, ast.unparse(node))
+        except InvalidFormula as error:
+            raise RuntimeError(
+                f"Invalid coordinate argument: {ast.dump(node)}"
+            ) from error
+        key = (coordinate, numeric_value)
         if key not in coordinate_cache:
             coordinate_cache[key] = torch.full_like(
                 samples[coordinate],
-                float(node.value),
+                numeric_value,
                 requires_grad=samples[coordinate].requires_grad,
             )
         value = coordinate_cache[key]
-    else:
-        raise RuntimeError(f"Invalid coordinate argument: {ast.dump(node)}")
     _record_coordinate(used_coordinates, coordinate, value)
     return value
 
 
 def _merge_coordinates(source, destination):
-    for coordinate in ["x", "y"]:
+    for coordinate in source:
         for value in source[coordinate]:
             _record_coordinate(destination, coordinate, value)
 
@@ -845,21 +1122,21 @@ def _coordinate_signature(coordinate_nodes):
     )
 
 
-def _direct_field_derivative(node, field_indices):
+def _direct_field_derivative(node, field_indices, coordinate_names):
     """Return a direct field derivative without evaluating its AST."""
-    derivative_order = [0, 0]
+    derivative_order = [0] * len(coordinate_names)
     while (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "grad"
     ):
         coordinate_node = node.args[1]
-        if not isinstance(coordinate_node, ast.Name) or coordinate_node.id not in (
-            "x",
-            "y",
+        if (
+            not isinstance(coordinate_node, ast.Name)
+            or coordinate_node.id not in coordinate_names
         ):
             return None
-        coordinate_index = 0 if coordinate_node.id == "x" else 1
+        coordinate_index = coordinate_names.index(coordinate_node.id)
         derivative_order[coordinate_index] += 1
         node = node.args[0]
 
@@ -867,15 +1144,15 @@ def _direct_field_derivative(node, field_indices):
         return None
     if isinstance(node, ast.Name) and node.id in field_indices:
         field = node.id
-        coordinate_nodes = (
-            ast.Name(id="x", ctx=ast.Load()),
-            ast.Name(id="y", ctx=ast.Load()),
+        coordinate_nodes = tuple(
+            ast.Name(id=coordinate, ctx=ast.Load())
+            for coordinate in coordinate_names
         )
     elif (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in field_indices
-        and len(node.args) == 2
+        and len(node.args) == len(coordinate_names)
     ):
         field = node.func.id
         coordinate_nodes = tuple(node.args)
@@ -886,18 +1163,19 @@ def _direct_field_derivative(node, field_indices):
 
 
 def _supports_analytic_derivative(derivative_order):
-    x_order, y_order = derivative_order
     return (
-        not (x_order and y_order)
+        sum(component > 0 for component in derivative_order) <= 1
         and max(derivative_order) <= MAX_ANALYTIC_DERIVATIVE_ORDER
     )
 
 
-def _collect_derivative_requests(node, field_indices):
+def _collect_derivative_requests(node, field_indices, coordinate_names):
     requests = {}
 
     def visit(child):
-        derivative = _direct_field_derivative(child, field_indices)
+        derivative = _direct_field_derivative(
+            child, field_indices, coordinate_names
+        )
         if derivative is not None and _supports_analytic_derivative(derivative[2]):
             _, coordinate_nodes, derivative_order = derivative
             signature = _coordinate_signature(coordinate_nodes)
@@ -922,10 +1200,11 @@ def evaluate(
     used_coordinates=None,
     evaluation_cache=None,
 ):
+    coordinate_names = tuple(samples)
     if coordinate_cache is None:
         coordinate_cache = {}
     if used_coordinates is None:
-        used_coordinates = {"x": [], "y": []}
+        used_coordinates = {coordinate: [] for coordinate in coordinate_names}
     if evaluation_cache is None:
         evaluation_cache = {
             "model_outputs": {},
@@ -936,7 +1215,9 @@ def evaluate(
     derivative_cache = evaluation_cache["derivative_outputs"]
     derivative_requests = evaluation_cache["derivative_requests"]
 
-    direct_derivative = _direct_field_derivative(node, field_indices)
+    direct_derivative = _direct_field_derivative(
+        node, field_indices, coordinate_names
+    )
     if (
         direct_derivative is not None
         and _supports_analytic_derivative(direct_derivative[2])
@@ -951,7 +1232,9 @@ def evaluate(
                 coordinate_cache,
                 used_coordinates,
             )
-            for coordinate, coordinate_node in zip(["x", "y"], coordinate_nodes)
+            for coordinate, coordinate_node in zip(
+                coordinate_names, coordinate_nodes
+            )
         ]
         signature = _coordinate_signature(coordinate_nodes)
         requested_orders = derivative_requests.get(
@@ -962,7 +1245,9 @@ def evaluate(
             derivative_cache[cache_key] = model.forward_with_derivatives(
                 *coordinates, requested_orders
             )
-            model_cache[cache_key] = derivative_cache[cache_key][(0, 0)]
+            model_cache[cache_key] = derivative_cache[cache_key][
+                (0,) * len(coordinate_names)
+            ]
         field_index = field_indices[field]
         return derivative_cache[cache_key][derivative_order][
             :, field_index : field_index + 1
@@ -1007,13 +1292,17 @@ def evaluate(
         function_name = node.func.id
         if function_name == "grad":
             coordinate_node = node.args[1]
-            if not isinstance(coordinate_node, ast.Name) or coordinate_node.id not in [
-                "x",
-                "y",
-            ]:
-                raise RuntimeError("grad expects x or y as its second argument")
+            if (
+                not isinstance(coordinate_node, ast.Name)
+                or coordinate_node.id not in coordinate_names
+            ):
+                raise RuntimeError(
+                    f"grad expects one of {coordinate_names} as its second argument"
+                )
             coordinate = coordinate_node.id
-            local_coordinates = {"x": [], "y": []}
+            local_coordinates = {
+                name: [] for name in coordinate_names
+            }
             value = evaluate(
                 node.args[0],
                 samples,
@@ -1067,7 +1356,7 @@ def evaluate(
                     coordinate_cache,
                     used_coordinates,
                 )
-                for coordinate, arg in zip(["x", "y"], node.args)
+                for coordinate, arg in zip(coordinate_names, node.args)
             ]
             field_index = field_indices[function_name]
             cache_key = tuple(coordinates)
@@ -1081,13 +1370,15 @@ def evaluate(
                 derivative_cache[cache_key] = model.forward_with_derivatives(
                     *coordinates, requested_orders
                 )
-                model_cache[cache_key] = derivative_cache[cache_key][(0, 0)]
+                model_cache[cache_key] = derivative_cache[cache_key][
+                    (0,) * len(coordinate_names)
+                ]
             if cache_key not in model_cache:
                 model_cache[cache_key] = model(*coordinates)
             return model_cache[cache_key][:, field_index : field_index + 1]
     elif isinstance(node, ast.Name):
         if node.id in samples:
-            if node.id in ["x", "y"]:
+            if node.id in coordinate_names:
                 _record_coordinate(used_coordinates, node.id, samples[node.id])
             return samples[node.id]
         elif node.id in CONSTANTS:
@@ -1097,8 +1388,8 @@ def evaluate(
                 ast.Call(
                     func=ast.Name(id=node.id, ctx=ast.Load()),
                     args=[
-                        ast.Name(id="x", ctx=ast.Load()),
-                        ast.Name(id="y", ctx=ast.Load()),
+                        ast.Name(id=coordinate, ctx=ast.Load())
+                        for coordinate in coordinate_names
                     ],
                     keywords=[],
                 ),
@@ -1112,35 +1403,39 @@ def evaluate(
     raise RuntimeError(f"Unsupported expression: {ast.dump(node)}")
 
 
-def evaluate_expected_function(node, x, y):
+def evaluate_expected_function(node, samples):
     """Evaluate one parsed solution expression with the shared Torch evaluator."""
     value = evaluate(
         node,
-        samples={"x": x, "y": y},
+        samples=samples,
         model=None,
         field_indices={},
     )
-    value = torch.as_tensor(value, dtype=x.dtype, device=x.device)
+    reference = next(iter(samples.values()))
+    value = torch.as_tensor(
+        value, dtype=reference.dtype, device=reference.device
+    )
     if value.ndim == 0:
-        value = value.expand_as(x)
+        value = value.expand_as(reference)
     try:
-        value = torch.broadcast_to(value, x.shape)
+        value = torch.broadcast_to(value, reference.shape)
     except RuntimeError as error:
         raise ValueError(
-            f"Expected function has shape {tuple(value.shape)}, not {tuple(x.shape)}"
+            f"Expected function has shape {tuple(value.shape)}, "
+            f"not {tuple(reference.shape)}"
         ) from error
     if not torch.isfinite(value).all():
         raise ValueError("Expected function produced a non-finite value")
     return value
 
 
-def evaluate_solution_functions(solution_functions, variables, x, y):
+def evaluate_solution_functions(solution_functions, variables, samples):
     """Evaluate solution fields in the same order as the model outputs."""
     if set(solution_functions) != set(variables):
         raise ValueError("Solution fields do not match model output fields")
-    return torch.stack(
+    return torch.cat(
         [
-            evaluate_expected_function(solution_functions[variable], x, y)
+            evaluate_expected_function(solution_functions[variable], samples)
             for variable in variables
         ],
         dim=-1,
@@ -1152,10 +1447,154 @@ def evaluate_solution_functions(solution_functions, variables, x, y):
 
 
 def _domain_key(domain):
-    return tuple(
-        None if np.isnan(domain[coordinate]) else float(domain[coordinate])
-        for coordinate in ("x", "y")
+    payload = {}
+    for key, value in domain.items():
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and np.isnan(value):
+            value = None
+        payload[key] = value
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _as_interval(value):
+    return value if isinstance(value, list) else [value, value]
+
+
+def _geometry_latent_dimension(geometry):
+    kind = geometry["type"]
+    if kind == "box":
+        return sum(
+            isinstance(value, list)
+            for value in geometry["coordinates"].values()
+        )
+    if kind == "circle":
+        return 1 + int(isinstance(geometry.get("t"), list))
+    if kind == "disk":
+        return 2 + int(isinstance(geometry.get("t"), list))
+    if kind == "difference":
+        return _geometry_latent_dimension(geometry["outer"])
+    return 1 + max(
+        _geometry_latent_dimension(part) for part in geometry["parts"]
     )
+
+
+def domain_dimension(domain):
+    """Return the number of freely sampled dimensions in an equation domain."""
+    geometry = domain.get("_geometry")
+    if geometry is not None:
+        if geometry["type"] == "union":
+            return max(
+                domain_dimension(
+                    _domain_from_geometry(
+                        domain.get("_name", "union"),
+                        part,
+                        _geometry_coordinate_names(part),
+                    )
+                )
+                for part in geometry["parts"]
+            )
+        return _geometry_latent_dimension(geometry)
+    return sum(
+        np.isnan(domain[coordinate])
+        for coordinate in coordinate_names_from_domains([domain])
+    )
+
+
+def is_interior_domain(domain):
+    return domain_dimension(domain) == len(coordinate_names_from_domains([domain]))
+
+
+def _geometry_contains(geometry, samples):
+    kind = geometry["type"]
+    if kind == "box":
+        keep = torch.ones_like(next(iter(samples.values())), dtype=torch.bool)
+        for coordinate, value in geometry["coordinates"].items():
+            lower, upper = _as_interval(value)
+            keep &= samples[coordinate] >= lower
+            keep &= samples[coordinate] <= upper
+        return keep.flatten()
+    if kind in {"circle", "disk"}:
+        cx, cy = geometry["center"]
+        radius_squared = geometry["radius"] ** 2
+        squared_distance = (
+            (samples["x"] - cx).square() + (samples["y"] - cy).square()
+        )
+        tolerance = max(1e-8, radius_squared * 1e-5)
+        if kind == "circle":
+            return ((squared_distance - radius_squared).abs() <= tolerance).flatten()
+        return (squared_distance <= radius_squared).flatten()
+    if kind == "difference":
+        keep = _geometry_contains(geometry["outer"], samples)
+        for hole in geometry["holes"]:
+            keep &= ~_geometry_contains(hole, samples)
+        return keep
+    masks = [_geometry_contains(part, samples) for part in geometry["parts"]]
+    return torch.stack(masks).any(dim=0)
+
+
+def _transform_geometry(geometry, unit):
+    kind = geometry["type"]
+    if kind == "box":
+        samples = {}
+        column = 0
+        template = (
+            unit[:, :1]
+            if unit.size(1)
+            else torch.empty(unit.size(0), 1, dtype=unit.dtype)
+        )
+        for coordinate in COORDINATE_NAMES:
+            if coordinate not in geometry["coordinates"]:
+                continue
+            value = geometry["coordinates"][coordinate]
+            if isinstance(value, list):
+                lower, upper = value
+                samples[coordinate] = lower + (upper - lower) * unit[:, column : column + 1]
+                column += 1
+            else:
+                samples[coordinate] = torch.full_like(template, float(value))
+        return samples
+    if kind in {"circle", "disk"}:
+        if kind == "circle":
+            radius = torch.full_like(unit[:, :1], float(geometry["radius"]))
+            angle_column = 0
+            next_column = 1
+        else:
+            radius = float(geometry["radius"]) * torch.sqrt(unit[:, :1])
+            angle_column = 1
+            next_column = 2
+        angle = 2 * math.pi * unit[:, angle_column : angle_column + 1]
+        cx, cy = geometry["center"]
+        samples = {
+            "x": cx + radius * torch.cos(angle),
+            "y": cy + radius * torch.sin(angle),
+        }
+        if "t" in geometry:
+            value = geometry["t"]
+            if isinstance(value, list):
+                lower, upper = value
+                samples["t"] = lower + (upper - lower) * unit[
+                    :, next_column : next_column + 1
+                ]
+            else:
+                samples["t"] = torch.full_like(unit[:, :1], float(value))
+        return samples
+    if kind == "union":
+        part_count = len(geometry["parts"])
+        choices = torch.clamp((unit[:, 0] * part_count).long(), max=part_count - 1)
+        combined = {}
+        for part_index, part in enumerate(geometry["parts"]):
+            rows = choices == part_index
+            if not rows.any():
+                continue
+            part_dimension = _geometry_latent_dimension(part)
+            values = _transform_geometry(part, unit[rows, 1 : 1 + part_dimension])
+            for coordinate, value in values.items():
+                combined.setdefault(
+                    coordinate, torch.empty(unit.size(0), 1, dtype=unit.dtype)
+                )[rows] = value
+        return combined
+    raise ValueError("difference geometries require rejection sampling")
 
 
 class CollocationSampler:
@@ -1171,40 +1610,92 @@ class CollocationSampler:
         self._engines = {}
         self._fixed_samples = {}
 
-    def _unit_samples(self, domain, nb_samples):
-        key = _domain_key(domain)
-        free_coordinates = sum(value is None for value in key)
-        if not free_coordinates:
+    def _unit_samples(self, key, nb_samples, dimensions):
+        if not dimensions:
             return torch.empty(nb_samples, 0)
         if self.method == "iid":
-            engine_key = ("iid", key)
+            engine_key = ("iid", key, dimensions)
             generator = self._engines.setdefault(
                 engine_key,
                 torch.Generator().manual_seed(self.seed + len(self._engines)),
             )
-            return torch.rand(nb_samples, free_coordinates, generator=generator)
-        engine_key = ("sobol", key)
+            return torch.rand(nb_samples, dimensions, generator=generator)
+        engine_key = ("sobol", key, dimensions)
         engine = self._engines.setdefault(
             engine_key,
             torch.quasirandom.SobolEngine(
-                free_coordinates,
+                dimensions,
                 scramble=True,
                 seed=self.seed + len(self._engines),
             ),
         )
         return engine.draw(nb_samples)
 
+    def _sample_geometry(self, geometry, nb_samples, key):
+        if geometry["type"] != "difference":
+            dimensions = _geometry_latent_dimension(geometry)
+            unit = self._unit_samples(key, nb_samples, dimensions)
+            return _transform_geometry(geometry, unit)
+
+        accepted = []
+        remaining = nb_samples
+        attempts = 0
+        while remaining:
+            attempts += 1
+            if attempts > 100:
+                raise RuntimeError("Could not sample enough points outside geometry holes")
+            candidate_count = max(remaining * 2, 64)
+            outer = geometry["outer"]
+            dimensions = _geometry_latent_dimension(outer)
+            unit = self._unit_samples(
+                f"{key}:rejection:{attempts}", candidate_count, dimensions
+            )
+            candidates = _transform_geometry(outer, unit)
+            keep = torch.ones(candidate_count, dtype=torch.bool)
+            for hole in geometry["holes"]:
+                keep &= ~_geometry_contains(hole, candidates)
+            take = min(remaining, int(keep.sum()))
+            if take:
+                indices = torch.nonzero(keep, as_tuple=False)[:take, 0]
+                accepted.append(
+                    {coordinate: value[indices] for coordinate, value in candidates.items()}
+                )
+                remaining -= take
+        return {
+            coordinate: torch.cat([batch[coordinate] for batch in accepted], dim=0)
+            for coordinate in accepted[0]
+        }
+
     def sample(self, domain, nb_samples, device, requires_grad=True):
         key = (_domain_key(domain), int(nb_samples))
         if self.method == "fixed_sobol" and key in self._fixed_samples:
-            unit = self._fixed_samples[key].clone()
+            samples = {
+                coordinate: value.clone()
+                for coordinate, value in self._fixed_samples[key].items()
+            }
         else:
-            unit = self._unit_samples(domain, nb_samples)
+            geometry = domain.get("_geometry")
+            if geometry is None:
+                geometry = {
+                    "type": "box",
+                    "coordinates": copy.deepcopy(domain["_bounds"]),
+                }
+            samples = self._sample_geometry(geometry, nb_samples, key[0])
             if self.method == "fixed_sobol":
-                self._fixed_samples[key] = unit.clone()
+                self._fixed_samples[key] = {
+                    coordinate: value.clone()
+                    for coordinate, value in samples.items()
+                }
 
-        if self.method == "wall_mixture" and all(
-            np.isnan(domain[coordinate]) for coordinate in ("x", "y")
+        geometry = domain.get("_geometry")
+        if (
+            self.method == "wall_mixture"
+            and geometry is not None
+            and geometry["type"] == "box"
+            and all(
+                isinstance(geometry["coordinates"].get(coordinate), list)
+                for coordinate in ("x", "y")
+            )
         ):
             wall_count = min(nb_samples, round(nb_samples * self.wall_fraction))
             if wall_count:
@@ -1219,40 +1710,39 @@ class CollocationSampler:
                     * self.wall_width
                 )
                 rows = torch.arange(wall_count)
-                unit[rows, axis] = torch.where(side.bool(), 1 - distance, distance)
+                for local_axis, coordinate in enumerate(("x", "y")):
+                    lower, upper = geometry["coordinates"][coordinate]
+                    selected = axis == local_axis
+                    if selected.any():
+                        normalized = torch.where(
+                            side[selected].bool(),
+                            1 - distance[selected],
+                            distance[selected],
+                        )
+                        samples[coordinate][rows[selected], 0] = (
+                            lower + (upper - lower) * normalized
+                        )
 
-        unit = unit.to(device=device)
-        samples = {}
-        free_index = 0
-        for coordinate in ("x", "y"):
-            if np.isnan(domain[coordinate]):
-                value = unit[:, free_index : free_index + 1]
-                free_index += 1
-            else:
-                value = torch.full(
-                    (nb_samples, 1), float(domain[coordinate]), device=device
-                )
-            samples[coordinate] = value.detach().requires_grad_(requires_grad)
-        return samples
+        return {
+            coordinate: value.to(device=device)
+            .detach()
+            .requires_grad_(requires_grad)
+            for coordinate, value in samples.items()
+        }
 
 
 def generate_samples(domain, nb_samples, device, requires_grad=True, sampler=None):
-    if sampler is not None:
-        return sampler.sample(domain, nb_samples, device, requires_grad)
-    samples = {"x": None, "y": None}
-    for inp in ["x", "y"]:
-        if np.isnan(domain[inp]):
-            samples[inp] = torch.rand(nb_samples, 1, device=device)
-        else:
-            samples[inp] = torch.full(
-                (nb_samples, 1), float(domain[inp]), device=device
-            )
-        samples[inp].requires_grad_(requires_grad)
-    return samples
+    if sampler is None:
+        sampler = CollocationSampler(method="iid")
+    return sampler.sample(domain, nb_samples, device, requires_grad)
 
 
-def _requires_autograd_derivatives(node, field_indices, analytic_derivatives):
-    derivative = _direct_field_derivative(node, field_indices)
+def _requires_autograd_derivatives(
+    node, field_indices, analytic_derivatives, coordinate_names
+):
+    derivative = _direct_field_derivative(
+        node, field_indices, coordinate_names
+    )
     if (
         analytic_derivatives
         and derivative is not None
@@ -1266,7 +1756,9 @@ def _requires_autograd_derivatives(node, field_indices, analytic_derivatives):
     ):
         return True
     return any(
-        _requires_autograd_derivatives(child, field_indices, analytic_derivatives)
+        _requires_autograd_derivatives(
+            child, field_indices, analytic_derivatives, coordinate_names
+        )
         for child in ast.iter_child_nodes(node)
     )
 
@@ -1274,6 +1766,9 @@ def _requires_autograd_derivatives(node, field_indices, analytic_derivatives):
 def compile_residuals(equations, field_indices, model):
     """Parse equations once and annotate their derivative requirements."""
     analytic_derivatives = hasattr(model, "forward_with_derivatives")
+    coordinate_names = tuple(
+        getattr(model, "coordinate_names", COORDINATE_NAMES[:2])
+    )
     residuals = []
     for formula in equations:
         lhs, rhs = formula.split("=")
@@ -1281,9 +1776,14 @@ def compile_residuals(equations, field_indices, model):
         residuals.append(
             (
                 node,
-                _collect_derivative_requests(node, field_indices),
+                _collect_derivative_requests(
+                    node, field_indices, coordinate_names
+                ),
                 _requires_autograd_derivatives(
-                    node, field_indices, analytic_derivatives
+                    node,
+                    field_indices,
+                    analytic_derivatives,
+                    coordinate_names,
                 ),
             )
         )
@@ -1459,13 +1959,14 @@ def compute_loss(
             },
         )
         equation_loss = torch.mean(torch.abs(res))
-        weight = 0.1 if np.isnan(domain["x"]) and np.isnan(domain["y"]) else 0.9
+        weight = 0.1 if is_interior_domain(domain) else 0.9
         losses.append(weight * equation_loss)
     return torch.stack(losses).mean()
 
 
 def _is_interior_domain(domain):
-    return np.isnan(domain["x"]) and np.isnan(domain["y"])
+    """Backward-compatible alias for :func:`is_interior_domain`."""
+    return is_interior_domain(domain)
 
 
 def _training_progress(iteration, started, nb_iter, max_seconds):
@@ -1538,8 +2039,7 @@ def train_model(
     """Train and return a low-frequency SIREN for the parsed variables.
 
     ``iteration_callback`` receives ``(iteration, model, loss_value)`` after
-    each optimizer step. It is used by the CLI for optional frame collection
-    without coupling the reusable training loop to GIF generation.
+    each optimizer step, allowing library clients to collect diagnostics.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -1550,14 +2050,16 @@ def train_model(
     field_indices = {
         variable: index for index, variable in enumerate(variables)
     }
+    coordinate_names = coordinate_names_from_domains(domains)
     model = Siren(
-        in_features=2,
+        in_features=len(coordinate_names),
         hidden_features=hidden_features,
         hidden_layers=hidden_layers,
         out_features=len(variables),
         first_omega_0=first_omega_0,
         hidden_omega_0=hidden_omega_0,
     ).to(device)
+    model.coordinate_names = coordinate_names
     residuals = _compile_residuals(equations, field_indices, model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -1577,8 +2079,8 @@ def train_model(
     if max_seconds is not None:
         if max_seconds <= 4:
             raise ValueError("max_seconds must be greater than 4 seconds")
-        # Match the cavity benchmark: leave four seconds for validation and
-        # process/GIF bookkeeping inside the advertised runtime budget.
+        # Leave four seconds for validation and caller-side bookkeeping inside
+        # the advertised runtime budget.
         deadline = started + max_seconds - 4.0
 
     model.train()
@@ -1591,7 +2093,7 @@ def train_model(
         optimizer.zero_grad(set_to_none=True)
         sample_counts = [nb_samples] * len(equations)
         for index, domain in enumerate(domains):
-            if not np.isnan(domain["x"]) and not np.isnan(domain["y"]):
+            if domain_dimension(domain) == 0:
                 sample_counts[index] = 1
         equation_losses, _ = compute_equation_losses(
             residuals,
@@ -1644,8 +2146,8 @@ def _plot_limits(minimum, maximum):
     return minimum, maximum
 
 
-def make_static_plot(frame, variables, output_file):
-    """Save one final approximation frame with the GIF's field layout."""
+def make_static_plot(frame, variables, output_file, extent=(0, 1, 0, 1)):
+    """Save one final multi-field approximation image."""
     frame = np.asarray(frame)
     if frame.ndim != 3 or frame.shape[-1] != len(variables):
         raise ValueError(
@@ -1662,11 +2164,14 @@ def make_static_plot(frame, variables, output_file):
     )
     for field_index, variable in enumerate(variables):
         field = frame[:, :, field_index]
-        field_limits = _plot_limits(field.min(), field.max())
+        if not np.isfinite(field).any():
+            raise ValueError(f"Field {variable!r} has no finite values")
+        field_limits = _plot_limits(np.nanmin(field), np.nanmax(field))
         axis = axes[0, field_index]
         image_artist = axis.imshow(
             field,
-            extent=(0, 1, 0, 1),
+            extent=extent,
+            origin="lower",
             vmin=field_limits[0],
             vmax=field_limits[1],
         )
@@ -1679,288 +2184,3 @@ def make_static_plot(frame, variables, output_file):
     fig.tight_layout()
     fig.savefig(str(output_file), dpi=150)
     plt.close(fig)
-
-
-def make_gif(frames, variables, output_file, solution=None):
-    """Animate approximations and optionally show analytic solutions below them."""
-    if not frames:
-        raise ValueError("Cannot generate a GIF without frames")
-
-    frames = [np.asarray(frame) for frame in frames]
-    if solution is not None:
-        solution = np.asarray(solution)
-        if solution.shape != frames[0].shape:
-            raise ValueError(
-                f"Solution grid has shape {solution.shape}, expected "
-                f"{frames[0].shape}"
-            )
-
-    row_count = 2 if solution is not None else 1
-    column_count = len(variables)
-    fig, axes = plt.subplots(
-        row_count,
-        column_count,
-        squeeze=False,
-        figsize=(4.8 * column_count, 4.0 * row_count),
-    )
-    approximation_images = []
-
-    for field_index, variable in enumerate(variables):
-        if solution is not None:
-            minimum = min(
-                solution[:, :, field_index].min(),
-                *(frame[:, :, field_index].min() for frame in frames),
-            )
-            maximum = max(
-                solution[:, :, field_index].max(),
-                *(frame[:, :, field_index].max() for frame in frames),
-            )
-            field_limits = _plot_limits(minimum, maximum)
-        else:
-            field_limits = _plot_limits(
-                frames[0][:, :, field_index].min(),
-                frames[0][:, :, field_index].max(),
-            )
-
-        approximation_axis = axes[0, field_index]
-        approximation_image = approximation_axis.imshow(
-            frames[0][:, :, field_index],
-            extent=(0, 1, 0, 1),
-            vmin=field_limits[0],
-            vmax=field_limits[1],
-        )
-        approximation_images.append(approximation_image)
-        fig.colorbar(approximation_image, ax=approximation_axis)
-        approximation_axis.set_title(f"Approximation: {variable}")
-        approximation_axis.set_xlabel("x")
-        approximation_axis.set_ylabel("y")
-        approximation_axis.margins(0)
-
-        if solution is not None:
-            solution_axis = axes[1, field_index]
-            solution_image = solution_axis.imshow(
-                solution[:, :, field_index],
-                extent=(0, 1, 0, 1),
-                vmin=field_limits[0],
-                vmax=field_limits[1],
-            )
-            fig.colorbar(solution_image, ax=solution_axis)
-            solution_axis.set_title(f"Solution: {variable}")
-            solution_axis.set_xlabel("x")
-            solution_axis.set_ylabel("y")
-            solution_axis.margins(0)
-
-    fig.tight_layout()
-
-    def animate(frame_index):
-        out = frames[frame_index]
-        for field_index, image_artist in enumerate(approximation_images):
-            z = out[:, :, field_index]
-            image_artist.set_data(z)
-            if solution is None:
-                image_artist.set_clim(*_plot_limits(z.min(), z.max()))
-        return approximation_images
-
-    ani = FuncAnimation(fig, animate, frames=len(frames))
-    pbar = trange(len(frames), desc="Generating GIF")
-    ani.save(
-        output_file,
-        writer=PillowWriter(fps=len(frames) / 3),
-        progress_callback=lambda i, n: pbar.update(1),
-    )
-    pbar.close()
-    plt.close(fig)
-
-
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--input_file",
-        "-i",
-        type=str,
-        required=True,
-        help="problem file containing '# Equations' and optional '# Solution' sections",
-    )
-    parser.add_argument(
-        "--output_file", "-o", type=str, default="out.gif", help="output gif filename"
-    )
-    parser.add_argument(
-        "--nb_iter",
-        type=int,
-        default=50000,
-        help="maximum optimizer steps (default: 50000)",
-    )
-    parser.add_argument(
-        "--nb_samples",
-        type=int,
-        default=2048,
-        help="samples per geometric domain (default: 2048)",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=0.0003, help="peak learning rate"
-    )
-    parser.add_argument(
-        "--min_lr", type=float, default=0.00001, help="cosine-decay floor"
-    )
-    parser.add_argument(
-        "--lr_schedule",
-        choices=("cosine", "exponential", "constant"),
-        default="cosine",
-        help="learning-rate schedule (default: cosine)",
-    )
-    parser.add_argument(
-        "--lr_gamma",
-        type=float,
-        default=0.99,
-        help="per-iteration exponential LR factor",
-    )
-    parser.add_argument(
-        "--hidden_layers", type=int, default=4, help="number of hidden layers"
-    )
-    parser.add_argument(
-        "--hidden_features", type=int, default=256, help="size of the hidden features"
-    )
-    parser.add_argument(
-        "--omega_0", type=float, default=3.0, help="first SIREN omega_0"
-    )
-    parser.add_argument(
-        "--hidden_omega_0",
-        type=float,
-        default=3.0,
-        help="hidden-layer SIREN omega_0",
-    )
-    parser.add_argument(
-        "--sampling",
-        choices=("iid", "sobol", "fixed_sobol", "wall_mixture"),
-        default="iid",
-        help="collocation sampler (default: iid)",
-    )
-    parser.add_argument(
-        "--grouped",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="share samples and field evaluations by geometric domain",
-    )
-    parser.add_argument(
-        "--penalty",
-        choices=("mse", "mae", "pseudo_huber"),
-        default="mse",
-        help="pointwise residual penalty (default: mse)",
-    )
-    parser.add_argument(
-        "--loss_balance",
-        choices=("boundary_pde_ramp", "equal_groups", "legacy"),
-        default="boundary_pde_ramp",
-        help="boundary/interior loss weighting (default: boundary_pde_ramp)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=0, help="Python, NumPy, and Torch seed"
-    )
-    parser.add_argument(
-        "--max_seconds",
-        type=float,
-        default=180.0,
-        help="training wall-clock budget (default: 180)",
-    )
-    parser.add_argument(
-        "--resolution", type=int, default=128, help="image resolution for the gif"
-    )
-    parser.add_argument(
-        "--nb_frames", type=int, default=50, help="number of frames for the gif"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Torch device; auto selects CUDA when available (default: auto)",
-    )
-    parser.add_argument(
-        "--no_gif", action="store_true", help="skip GIF frame collection and export"
-    )
-    args = parser.parse_args()
-    if args.device == "auto":
-        args.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    equations, variables, domains, solution_functions = parse_problem_file(
-        args.input_file
-    )
-    frames = []
-    frame_coordinates = None
-    animation_started = time.monotonic()
-    animation_state = {
-        "next_frame_fraction": 0.0,
-        "last_frame_iteration": None,
-    }
-    if not args.no_gif:
-        frame_coordinates = torch.cartesian_prod(
-            torch.linspace(0, 1, args.resolution),
-            torch.linspace(0, 1, args.resolution),
-        ).to(args.device)
-
-    def append_frame(iteration, model):
-        with torch.no_grad():
-            out = model(
-                frame_coordinates[:, 0:1], frame_coordinates[:, 1:2]
-            )
-        out = out.view(args.resolution, args.resolution, out.size(-1))
-        out = out.rot90().cpu().numpy()
-        frames.append(out)
-        animation_state["last_frame_iteration"] = iteration
-
-    def collect_frame(iteration, model, loss_value):
-        current_fraction = min(
-            1.0,
-            (time.monotonic() - animation_started)
-            / max(1e-6, args.max_seconds - 4.0),
-        )
-        if current_fraction >= animation_state["next_frame_fraction"]:
-            append_frame(iteration, model)
-            animation_state["next_frame_fraction"] += 1.0 / max(
-                1, args.nb_frames
-            )
-
-    model = train_model(
-        equations,
-        variables,
-        domains,
-        nb_iter=args.nb_iter,
-        nb_samples=args.nb_samples,
-        lr=args.lr,
-        min_lr=args.min_lr,
-        lr_schedule=args.lr_schedule,
-        lr_gamma=args.lr_gamma,
-        hidden_layers=args.hidden_layers,
-        hidden_features=args.hidden_features,
-        first_omega_0=args.omega_0,
-        hidden_omega_0=args.hidden_omega_0,
-        sampling=args.sampling,
-        grouped=args.grouped,
-        penalty=args.penalty,
-        loss_balance=args.loss_balance,
-        seed=args.seed,
-        max_seconds=args.max_seconds,
-        device=args.device,
-        iteration_callback=None if args.no_gif else collect_frame,
-    )
-
-    if not args.no_gif:
-        if (
-            animation_state["last_frame_iteration"] is None
-            or len(frames) < args.nb_frames
-        ):
-            append_frame(args.nb_iter, model)
-        solution = None
-        if solution_functions:
-            with torch.no_grad():
-                solution = evaluate_solution_functions(
-                    solution_functions,
-                    variables,
-                    frame_coordinates[:, 0],
-                    frame_coordinates[:, 1],
-                )
-            solution = solution.view(
-                args.resolution, args.resolution, len(variables)
-            )
-            solution = solution.rot90().cpu().numpy()
-        make_gif(frames, variables, args.output_file, solution=solution)
